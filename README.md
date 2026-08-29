@@ -34,7 +34,7 @@ reviews its own output before you see it:
 
 4. **Set up API keys**
    ```bash
-   cp .env.example .env
+   Make an file called .env for saving API keys and other env variables. 
    ```
    Then edit `.env` and fill in:
    - `ANTHROPIC_API_KEY` — from [platform.claude.com](https://platform.claude.com) (API Keys section)
