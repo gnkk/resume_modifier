@@ -119,22 +119,7 @@ Output (in `data/output/`):
 - `resume_review.json` — the chosen job, both stages' final verdicts,
   and the full cycle-by-cycle history for each stage
 
-## GitHub integration (deferred)
 
-The context agent already has GitHub MCP wiring in `agents/context_agent.py`,
-but it stays off until you set `GITHUB_PAT` in `.env` — no code changes
-needed when you're ready:
-
-1. Create a fine-grained GitHub Personal Access Token scoped to
-   `Contents: Read` (and `Read/Write` if you later want the agent to
-   push commits/PRs) on the repos you want it to look at.
-2. Set `GITHUB_PAT=<token>` in `.env`.
-3. Run the pipeline as usual — the context agent will automatically
-   pull in GitHub project details (READMEs, languages, notable repos)
-   to supplement the resume content.
-
-Without a `GITHUB_PAT` set, the context agent runs on the resume PDF
-(+ optional job description file) alone.
 
 ## Project structure
 
@@ -214,11 +199,3 @@ how recent a posting must be. Firecrawl's `tbs` parameter also accepts
   is a careful, honest judgment call, which is exactly where a weaker
   model costs you the most.
 
-## Next steps (not yet built)
-
-- GitHub integration is wired but deferred — see "GitHub integration" above.
-- Pushing the finished project / output to GitHub (open a PR with the
-  tailored resume, or commit output artifacts) — planned for later.
-- Support for multiple target roles in one run.
-- Caching Firecrawl search/scrape results across job-search cycles so a
-  cycle doesn't need to fully re-search from scratch.
