@@ -13,7 +13,7 @@ load_dotenv()  # reads .env in the project root
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY")
-GITHUB_PAT = os.environ.get("GITHUB_PAT")
+GITHUB_PAT = os.environ.get("GITHUB_PAT")  # not used yet — GitHub integration is a later step
 
 if not ANTHROPIC_API_KEY:
     raise RuntimeError(
@@ -25,23 +25,24 @@ if not FIRECRAWL_API_KEY:
         "FIRECRAWL_API_KEY not found. Copy .env.example to .env "
         "and fill in your real key."
     )
-if not GITHUB_PAT:
-    raise RuntimeError(
-        "GITHUB_PAT not found. Copy .env.example to .env and fill in "
-        "a GitHub Personal Access Token (Contents: Read/Write, "
-        "Pull requests: Read/Write scopes on the target repo)."
-    )
 
 # --- Model selection per agent/task ---
-# Reasoning/orchestration and final writing quality matter most here,
-# so those get Sonnet 5. Cheap mechanical filtering can use Haiku 4.5.
-MODEL_ORCHESTRATOR = "claude-sonnet-5"   # decides what to search/scrape/read next
-MODEL_WRITER = "claude-sonnet-5"         # drafts/rewrites resume content
-MODEL_FILTER = "claude-haiku-4-5-20251001"  # cheap pre-filtering of scraped text
-MODEL_REFLECTOR = "claude-sonnet-5"      # critiques the draft, using adaptive thinking
+# Every agent that makes judgment calls (what to search, what to write,
+# how to judge) runs on a top-tier model per project requirements.
+# Sonnet 5 is the default; swap to "claude-opus-5" per-agent below if
+# you want the extra reasoning headroom for a specific step.
+MODEL_CONTEXT = "claude-sonnet-5"     # reads resume PDF + (later) GitHub context
+MODEL_SEARCH = "claude-sonnet-5"      # finds the single best-matching job via Firecrawl
+MODEL_WRITER = "claude-sonnet-5"      # drafts/revises resume content
+MODEL_JUDGE = "claude-sonnet-5"       # judges the draft with adaptive thinking, drives the revise loop
+
+# --- Revise loop ---
+MAX_REVISE_CYCLES = 5      # hard cap on writer <-> judge cycles
+JUDGE_APPROVAL_SCORE = 8   # fitness_score (1-10) at/above which the judge can approve early
 
 # --- Firecrawl ---
 FIRECRAWL_BASE_URL = "https://api.firecrawl.dev"
+JOB_SEARCH_TBS = "qdr:w"  # restrict job search to postings newer than this (past week)
 
 # --- Paths ---
 DATA_INPUT_DIR = "data/input"
