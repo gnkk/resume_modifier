@@ -27,7 +27,7 @@ Rules:
 - Flag clearly (in a separate notes section at the end) any gaps between the \
 candidate's experience and the job's requirements — do not paper over them.
 - Output the resume as clean Markdown (headers, bullet lists) — it will later \
-be rendered to HTML and PDF, so avoid raw HTML and avoid decorative characters \
+be rendered to PDF, so avoid raw HTML and avoid decorative characters \
 that don't map cleanly to Markdown.
 
 When you are given prior feedback from a reviewing judge along with your own \

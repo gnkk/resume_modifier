@@ -1,37 +1,44 @@
 # Resume Building Agent
 
 An agentic pipeline that finds the best-matching job posted in the last
-week, tailors your resume to it, and critically reviews its own work
-across multiple revision cycles before you see the final output:
+week, tailors your resume to it, and critically reviews its own work at
+**two separate, sequential stages** before you see the final output:
 
 1. **Context agent** (Claude Sonnet 5) — reads your existing resume
    (PDF), and a job description file if you provide one. GitHub project
    context is wired in but **off by default** (see "GitHub integration"
    below) — this agent does **not** search the web for jobs; that's step 2.
-2. **Search agent** (Claude Sonnet 5) — uses **Firecrawl's real-time
-   web search** (with its `tbs` time filter) to find candidate job
-   postings, restricted to postings **newer than one week**, with full
-   page content scraped inline. Picks the single best-matching job with
-   a realistic chance of a positive response — not just the first
-   plausible listing.
-3. **Writer agent** (Claude Sonnet 5) — drafts a tailored resume from
-   the gathered context and the chosen job, flagging any experience
-   gaps rather than inventing content.
-4. **Judge agent** (Claude Sonnet 5, adaptive thinking, high effort)
-   — critically reviews the draft against the job: a fitness score,
-   strengths, gaps, concrete suggestions, and an explicit
-   approve/revise decision. Written to push back on weak output
-   rather than rubber-stamp it.
+2. **Search agent <-> Judge** (Claude Sonnet 5, adaptive thinking, high
+   effort) — the search agent uses **Firecrawl's real-time web search**
+   (with its `tbs` time filter) to find the single best-matching job
+   posting, restricted to postings **newer than one week**, with full
+   page content scraped inline. The judge then evaluates ONLY that job
+   pick: is it genuinely the best match, does the posting look live and
+   current, does the application link look real and working. If the
+   judge doesn't approve, the search agent tries again — with the
+   rejected pick(s) and the judge's specific concerns — and must return
+   a **different** posting. This runs for up to **3 cycles**, or until
+   the judge approves early, whichever comes first. **No resume is
+   written until this stage finishes.**
+3. **Writer agent <-> Judge** (Claude Sonnet 5) — only once a job is
+   locked in from step 2, the writer drafts a tailored resume from the
+   gathered context and that job, flagging any experience gaps rather
+   than inventing content. The judge then evaluates ONLY the resume:
+   fitness score, strengths, gaps, concrete suggestions. If not
+   approved, the writer revises against that feedback. This also runs
+   for up to **3 cycles**, or until the judge approves early, whichever
+   comes first.
 
-Steps 3 and 4 run in a loop: the judge's comments and the previous
-draft go back to the writer for a rewrite, for up to **5 cycles**, or
-until the judge approves early (fitness score clears the threshold in
-`config.py`, or the judge decides no further meaningful improvement is
-available).
+These two loops are independent and run one after the other — the job
+is fully settled (approved, or cycles exhausted) before the writer ever
+starts drafting, since there's no point tailoring a resume to a job
+that might still change.
 
-The final approved resume is rendered as both a scrollable **HTML**
-page and a matching **PDF** — same content, two formats, one source of
-truth.
+The final resume is rendered as **Markdown** and a matching **PDF** —
+same content, two formats. The judge's final remarks from both stages
+(job match score + notes, resume fitness score + strengths/gaps/
+suggestions, and the job application link) are rendered separately as a
+standalone **HTML** review page.
 
 ## Setup
 
@@ -62,8 +69,8 @@ truth.
    sudo apt-get install libpango-1.0-0 libpangoft2-1.0-0
    ```
    If you skip this, everything else in the pipeline still works — only
-   the final PDF export step will fail, and the HTML/Markdown outputs
-   are unaffected.
+   the final PDF export step will fail, and the Markdown output is
+   unaffected.
 
 4. **Set up API keys**
 
@@ -104,10 +111,13 @@ python main.py data/input/my_resume.pdf "Data Scientist at Shopify" data/input/j
 
 Output (in `data/output/`):
 - `tailored_resume.md` — the final tailored resume (Markdown)
-- `tailored_resume.html` — the same resume as a scrollable HTML page
 - `tailored_resume.pdf` — the same resume as a PDF
-- `resume_review.json` — the chosen job, the judge's final verdict, and
-  the full cycle-by-cycle review history
+- `resume_review.html` — the judge's final remarks from both stages:
+  job match score + notes, resume fitness score +
+  strengths/gaps/suggestions, job posting trust notes, and a working
+  link to the job application
+- `resume_review.json` — the chosen job, both stages' final verdicts,
+  and the full cycle-by-cycle history for each stage
 
 ## GitHub integration (deferred)
 
@@ -134,28 +144,20 @@ resume-agent/
 │   ├── context_agent.py   # tool-calling loop: resume PDF read (+ optional GitHub MCP)
 │   ├── search_agent.py    # Firecrawl real-time search (tbs-filtered) -> single best job
 │   ├── writer.py           # drafts + revises resume content
-│   └── judge.py             # critiques the draft using adaptive thinking, approves or sends back
+│   └── judge.py             # review_job() for stage 1, review_resume() for stage 2
 ├── tools/
 │   ├── pdf_reader.py     # PDF text extraction
 │   ├── text_reader.py    # plain .txt file reading (job descriptions)
 │   └── firecrawl_tool.py # real-time web search (tbs recency filter) + page scraping
-├── html_renderer.py       # Markdown -> scrollable HTML page
-├── pdf_renderer.py         # same HTML -> PDF
+├── html_renderer.py       # renders both judge verdicts as a standalone HTML review page
+├── pdf_renderer.py         # renders the tailored resume Markdown to PDF
 ├── data/
 │   ├── input/            # put source resumes + job description files here
-│   └── output/           # generated resume (md/html/pdf) + review land here
+│   └── output/            # generated resume (md/pdf) + review (html/json) land here
 ├── config.py              # env vars + model selection + loop settings
-├── main.py                 # entry point: runs the full pipeline
+├── main.py                 # entry point: runs the full two-stage pipeline
 └── requirements.txt
 ```
-
-> **Note:** `agents/orchestrator.py`, `agents/reflector.py`, and
-> `tools/tavily_tool.py` are deprecated leftovers from earlier
-> iterations of this architecture. They now just raise `ImportError`
-> with a pointer to their replacement — delete them:
-> ```bash
-> rm agents/orchestrator.py agents/reflector.py tools/tavily_tool.py
-> ```
 
 ## On "reasoning model"
 
@@ -165,19 +167,26 @@ mode where Claude reasons through a hidden scratchpad before answering,
 controlled by an `effort` level (`standard`, `high`, `xhigh`, `max`) rather
 than a manual token budget. The judge agent uses
 `thinking={"type": "adaptive"}` with `output_config={"effort": "high"}` for
-exactly this reason: judging resume quality and job fit is an evaluative,
-multi-factor call, not a generation task, and benefits from that extra
-reasoning step.
+both `review_job()` and `review_resume()`, for the same reason: judging job
+fit and judging resume quality are both evaluative, multi-factor calls, not
+generation tasks, and benefit from that extra reasoning step.
 
-## Tuning the revise loop
+## Tuning the two revise loops
 
 In `config.py`:
-- `MAX_REVISE_CYCLES` (default 5) — hard cap on writer↔judge cycles.
-- `JUDGE_APPROVAL_SCORE` (default 8) — fitness score (1–10) at/above which
-  the judge can approve early instead of running all 5 cycles. The judge
-  can still withhold approval above this score, or approve slightly below
-  it, if it reasons that's the right call — see `agents/judge.py`'s system
-  prompt.
+- `MAX_JOB_SEARCH_CYCLES` (default 3) — hard cap on search-agent↔judge
+  cycles for the job-match stage. This runs to completion (approval, or
+  cycles exhausted) before the resume stage starts.
+- `MAX_RESUME_REVISE_CYCLES` (default 3) — hard cap on writer↔judge
+  cycles for the resume stage, which only starts once the job stage
+  is done.
+- `JUDGE_APPROVAL_SCORE` (default 8) — score (1–10) at/above which the
+  judge can approve early instead of running all available cycles.
+  Applies to both the job match score and the resume fitness score —
+  the judge can still withhold approval above this score, or approve
+  slightly below it, if it reasons that's the right call. See
+  `agents/judge.py`'s two system prompts (`JOB_SYSTEM_PROMPT` and
+  `RESUME_SYSTEM_PROMPT`).
 
 ## Tuning the job search recency window
 
@@ -191,11 +200,13 @@ how recent a posting must be. Firecrawl's `tbs` parameter also accepts
 
 - All four agents use `claude-sonnet-5` ($2/$10 per MTok in/out) by
   default. The judge's adaptive thinking adds reasoning tokens (billed
-  as output) on top of the base cost, and the revise loop means the
-  writer + judge cost is multiplied by however many cycles actually run.
-- A typical run (context read + job search + 2-3 revise cycles) costs
-  roughly $0.40–$1.20 in API usage, depending on how many cycles the
-  judge requires.
+  as output) on top of the base cost, at both stages. The two revise
+  loops mean the total cost is multiplied by however many cycles each
+  stage actually runs (up to 3 + 3 = 6 judge calls in the worst case,
+  plus the corresponding search/writer calls).
+- A typical run (context read + 1-2 job-search cycles + 1-2 resume-revise
+  cycles) costs roughly $0.40–$1.20 in API usage, depending on how many
+  cycles each stage requires.
 - Swap any `MODEL_*` constant in `config.py` to `claude-opus-5` for a
   specific agent if you want more reasoning headroom there, or to
   `claude-haiku-4-5-20251001` to cut cost during testing. Keep
@@ -209,50 +220,5 @@ how recent a posting must be. Firecrawl's `tbs` parameter also accepts
 - Pushing the finished project / output to GitHub (open a PR with the
   tailored resume, or commit output artifacts) — planned for later.
 - Support for multiple target roles in one run.
-- Caching Firecrawl search/scrape results across revise cycles so a
-  cycle doesn't need to re-search if the job hasn't changed.
-
-## Known limitations / before you rely on this
-
-Read this before running against a real job search — none of the items
-below are done yet.
-
-**Rotate your API keys.** During this rework, `.env` was read as part of
-making these changes, exposing the Anthropic key, Firecrawl key, and
-GitHub PAT that were live at the time. Treat all three as compromised and
-regenerate them:
-- Anthropic: console.anthropic.com → API Keys
-- Firecrawl: your Firecrawl dashboard
-- GitHub PAT: github.com/settings/tokens → revoke and reissue with the
-  same scopes
-
-**Delete deprecated files manually.** These were stubbed to raise
-`ImportError` rather than removed, since file deletion wasn't available
-during the rework:
-```bash
-rm agents/orchestrator.py agents/reflector.py tools/tavily_tool.py
-```
-
-**No live end-to-end run has been done.** Everything has been verified
-by syntax-checking every file, import-checking the real module graph
-with dummy env vars (including both the GitHub-off and GitHub-on code
-paths), and unit-testing the control flow (writer↔judge loop early-exit
-and max-cycle-exhaustion paths) and the Firecrawl `search()`/`scrape()`
-parsing against mocked responses shaped like Firecrawl's real v2 API.
-None of this used a real Anthropic or Firecrawl API call. Things that
-are only "should be right" until a real run confirms them:
-- The exact `thinking`/`output_config` parameter shapes the Anthropic
-  SDK expects for adaptive thinking in `agents/judge.py`.
-- The MCP beta header string (`mcp-client-2025-11-20`) and
-  `mcp_toolset`/`mcp_servers` wiring in `agents/context_agent.py`,
-  once you turn GitHub on.
-- Whether WeasyPrint's system dependency (`pango`, etc.) is already
-  satisfied on your machine — untested locally.
-
-**The stray nested folder** `resume-agent/resume-agent/` was left
-untouched and never opened to confirm what's in it. It looks like a
-duplicate scaffold, but that was an assumption, not a verified fact.
-
-The suggested next step is a real run — `python main.py
-data/input/<resume>.pdf "<role>"` — checking each stage's output as it
-goes, rather than more static review.
+- Caching Firecrawl search/scrape results across job-search cycles so a
+  cycle doesn't need to fully re-search from scratch.
