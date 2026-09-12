@@ -2,14 +2,22 @@
 Context agent.
 
 Owns the tool-calling loop for gathering everything about the
-CANDIDATE (as opposed to the job): reads the existing resume PDF, and
-an optional job description file if one was provided directly.
+CANDIDATE (as opposed to the job): reads the real resume PDF passed on
+the command line, plus an optional job description file if one was
+provided directly.
+
+Sample/template resume:
+NOT handled here. The template is read directly in main.py and passed
+to the writer (and judge) as raw text — see agents/writer.py's module
+docstring. Summarizing a layout into prose here lost precisely the
+detail that made output match the template, so that hop was removed.
+This agent is concerned only with the candidate's factual background.
 
 GitHub project context (via GitHub's official MCP server) is wired in
 but OFF by default — this project's GitHub integration is a deferred
 step. Set GITHUB_PAT in .env and it activates automatically; without
 it, this agent runs on the resume PDF (+ optional job description
-file) alone, no code changes needed later.
+file, + optional sample resume) alone, no code changes needed later.
 
 This agent deliberately does NOT search the web for jobs — that is
 the search agent's job (see search_agent.py). Keeping the two split
@@ -27,6 +35,9 @@ import anthropic
 from config import ANTHROPIC_API_KEY, MODEL_CONTEXT
 from tools.pdf_reader import read_pdf, PDF_READER_TOOL_SCHEMA
 from tools.text_reader import read_text_file, TEXT_READER_TOOL_SCHEMA
+from logger_setup import get_logger
+
+log = get_logger(__name__)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -45,6 +56,12 @@ GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 # Beta header required for the MCP connector + mcp_toolset tool entry.
 MCP_BETA_HEADER = "mcp-client-2025-11-20"
 
+# Generous budget: this summary carries the full resume text (plus GitHub
+# context and style-reference notes when enabled) and is the sole input every
+# downstream agent reasons from. Running out mid-write would silently starve
+# the whole pipeline. See the same note in agents/writer.py.
+MAX_OUTPUT_TOKENS = 16000
+
 SYSTEM_PROMPT_BASE = """You are a candidate-context assistant. Your only job \
 is to gather information ABOUT THE CANDIDATE — you do not look for jobs; a \
 separate agent handles that.
@@ -52,40 +69,59 @@ separate agent handles that.
 You will be given a path to the candidate's existing resume PDF, and \
 OPTIONALLY a path to a job description .txt file the user has already saved.
 
-1. Always read the existing resume with read_pdf first.
+1. Always read the existing resume with read_pdf first. This is the \
+candidate's real, factual background — the only source of truth for what \
+they have actually done.
 2. If a job description file path was provided, read it with read_text_file \
 and include its content verbatim in your summary — this will be handed to \
 the search agent as a strong signal of what to look for, or to the writer \
-directly if the job is already fully decided."""
+directly if the job is already fully decided.
+3. Capture the candidate's background in full and faithfully: every role \
+with employer, title, dates and what they actually did; education; skills; \
+projects; certifications; contact details. Downstream agents see only your \
+summary, never the original PDF — anything you leave out cannot appear on \
+the resume. Do not editorialize, rank, or trim for relevance; that is the \
+writer's job."""
 
 SYSTEM_PROMPT_GITHUB_ADDENDUM = """
-3. Use the GitHub tools to look at the candidate's repositories (README \
+4. Use the GitHub tools to look at the candidate's repositories (README \
 content, project structure, languages used, notable projects) for concrete \
 project details worth highlighting on a resume. Prioritize pinned/recently \
 updated repos and README quality over an exhaustive crawl.
-4. Stop once you have: the candidate's full resume content, and enough GitHub \
-project detail to meaningfully supplement it (or a clear note that GitHub had \
-nothing to add)."""
+5. Stop once you have the candidate's full resume content and enough GitHub \
+project detail to meaningfully supplement it (or a clear note that GitHub \
+had nothing to add)."""
 
 SYSTEM_PROMPT_NO_GITHUB_ADDENDUM = """
-3. Stop once you have the candidate's full resume content (and job \
-description content, if one was provided)."""
+4. Stop once you have the candidate's full resume content (and job \
+description content, if provided)."""
 
 SYSTEM_PROMPT_TAIL = """
 
+Structure your final summary in clearly labeled sections, e.g.:
+CANDIDATE BACKGROUND: <everything factual about the candidate>
+JOB DESCRIPTION (if provided): <verbatim content>
+
 Do not draft resume content and do not search the web for jobs — your output \
-is a structured summary of the candidate's background only."""
+is a structured summary of the candidate's background, nothing else."""
 
 
 _LOCAL_TOOL_NAMES = {"read_pdf", "read_text_file"}
 
 
 def _execute_tool(name: str, tool_input: dict) -> str:
-    if name == "read_pdf":
-        return read_pdf(tool_input["file_path"])
-    if name == "read_text_file":
-        return read_text_file(tool_input["file_path"])
-    raise ValueError(f"Unknown tool: {name}")
+    try:
+        if name == "read_pdf":
+            return read_pdf(tool_input["file_path"])
+        if name == "read_text_file":
+            return read_text_file(tool_input["file_path"])
+        raise ValueError(f"Unknown tool: {name}")
+    except KeyError as exc:
+        log.error("context_agent: tool '%s' called with missing input field: %s", name, exc, exc_info=True)
+        return f"[tool error: '{name}' was called without the required '{exc}' argument.]"
+    except Exception as exc:  # noqa: BLE001 — tool execution must never crash the agent loop
+        log.error("context_agent: unexpected error executing tool '%s': %s", name, exc, exc_info=True)
+        return f"[tool error: '{name}' failed unexpectedly — {exc}]"
 
 
 def gather_candidate_context(
@@ -104,6 +140,11 @@ def gather_candidate_context(
         A text summary of the candidate's resume content (+ GitHub
         project details, once GITHUB_PAT is configured), ready to hand
         to the search agent and/or writer.
+
+    Raises:
+        RuntimeError: if the underlying Claude API call fails in a way
+            that can't be recovered from (e.g. auth failure, persistent
+            network error), or if the agent produces no summary at all.
     """
     use_github = bool(GITHUB_PAT)
 
@@ -136,29 +177,68 @@ def gather_candidate_context(
             }
         ]
 
+    max_turns = 12  # safety valve against a runaway tool-calling loop
+    turn = 0
+
     while True:
-        if use_github:
-            response = client.beta.messages.create(
-                model=MODEL_CONTEXT,
-                max_tokens=4096,
-                system=system_prompt,
-                tools=all_tools,
-                mcp_servers=mcp_servers,
-                betas=[MCP_BETA_HEADER],
-                messages=messages,
+        turn += 1
+        if turn > max_turns:
+            log.error(
+                "context_agent: exceeded %d tool-calling turns without finishing; "
+                "returning what was gathered so far to avoid an infinite loop.",
+                max_turns,
             )
-        else:
-            response = client.messages.create(
-                model=MODEL_CONTEXT,
-                max_tokens=4096,
-                system=system_prompt,
-                tools=TOOLS,
-                messages=messages,
+            # Best-effort: ask the model directly for a final summary rather
+            # than looping forever or crashing the pipeline over this.
+            return (
+                "[context_agent warning: the context-gathering loop did not "
+                "finish cleanly within the turn limit. Candidate context may "
+                "be incomplete.]"
             )
+
+        try:
+            if use_github:
+                response = client.beta.messages.create(
+                    model=MODEL_CONTEXT,
+                    max_tokens=MAX_OUTPUT_TOKENS,
+                    system=system_prompt,
+                    tools=all_tools,
+                    mcp_servers=mcp_servers,
+                    betas=[MCP_BETA_HEADER],
+                    messages=messages,
+                )
+            else:
+                response = client.messages.create(
+                    model=MODEL_CONTEXT,
+                    max_tokens=MAX_OUTPUT_TOKENS,
+                    system=system_prompt,
+                    tools=TOOLS,
+                    messages=messages,
+                )
+        except anthropic.APIError as exc:
+            log.error("context_agent: Anthropic API call failed: %s", exc, exc_info=True)
+            raise RuntimeError(
+                f"context_agent: failed to reach the Anthropic API ({exc}). "
+                "Check your ANTHROPIC_API_KEY and network connection."
+            ) from exc
 
         if response.stop_reason != "tool_use":
             text_blocks = [b.text for b in response.content if b.type == "text"]
-            return "\n".join(text_blocks)
+            summary = "\n".join(text_blocks)
+            if not summary.strip():
+                log.error(
+                    "context_agent: model returned no text (stop_reason=%s, usage=%s). "
+                    "If stop_reason is 'max_tokens', the budget ran out before the "
+                    "summary was written — raise MAX_OUTPUT_TOKENS.",
+                    response.stop_reason, getattr(response, "usage", None),
+                )
+                raise RuntimeError(
+                    "context_agent: produced no candidate summary "
+                    f"(stop_reason={response.stop_reason}). Every downstream agent "
+                    "depends on this, so the run cannot continue. See the log for "
+                    "token usage."
+                )
+            return summary
 
         messages.append({"role": "assistant", "content": response.content})
 
