@@ -75,7 +75,6 @@ from job_history import filter_seen
 from tools.jobspy_tool import search as jobspy_search_fn
 from tools.firecrawl_tool import scrape as firecrawl_scrape_fn
 from tools.bm25_tool import rank_pool
-from tools.posting_sections import requirements_first
 from logger_setup import get_logger, note_model
 
 log = get_logger(__name__)
@@ -218,10 +217,8 @@ def plan_search_angles(candidate_context: str, target_role_description: str) -> 
 
 SCREENER_SYSTEM_PROMPT = f"""You are screening scraped job postings for one \
 candidate. You will be given a batch of postings — title, company, location, \
-and the opening of the description — each with an index. The description \
-extract you are given has usually been REORDERED to put the employer's \
-stated requirements first, so do not assume it reads in the posting's \
-original order. Rate how well each ONE fits this specific candidate.
+and the opening of the description — each with an index. Rate how well each \
+ONE fits this specific candidate.
 
 {MARKET_CALIBRATION}
 
@@ -271,7 +268,6 @@ text:
 
 def _screen_batch(
     batch: list[tuple[int, dict]],
-    snippets: dict[int, str],
     candidate_context: str,
     target_role_description: str,
 ) -> dict[int, dict]:
@@ -290,7 +286,9 @@ def _screen_batch(
             "company": record.get("company"),
             "location": record.get("location"),
             "is_remote": record.get("is_remote"),
-            "snippet": snippets.get(index, ""),
+            "snippet": str(
+                record.get("description_full") or record.get("description_snippet") or ""
+            )[:POOL_SCREEN_SNIPPET_CHARS],
         }
         for index, record in batch
     ]
@@ -375,29 +373,11 @@ def screen_pool(
 
     log.info("  Screening %d posting(s) for fit...", len(pool))
 
-    # Build each posting's slice up front so the extraction hit rate is
-    # visible as one number rather than buried per batch. A low rate means
-    # this layer is mostly falling back to head truncation and is costing
-    # complexity for little — see tools/posting_sections.py.
-    snippets: dict[int, str] = {}
-    extracted_count = 0
-    for index, record in enumerate(pool):
-        text = str(record.get("description_full") or record.get("description_snippet") or "")
-        snippet, extracted = requirements_first(text, POOL_SCREEN_SNIPPET_CHARS)
-        snippets[index] = snippet
-        extracted_count += int(extracted)
-
-    log.info(
-        "    requirements section found in %d of %d posting(s); the rest got "
-        "plain head truncation.",
-        extracted_count, len(pool),
-    )
-
     ratings: dict[int, dict] = {}
     indexed = list(enumerate(pool))
     for start in range(0, len(indexed), POOL_SCREEN_BATCH_SIZE):
         batch = indexed[start : start + POOL_SCREEN_BATCH_SIZE]
-        ratings.update(_screen_batch(batch, snippets, candidate_context, target_role_description))
+        ratings.update(_screen_batch(batch, candidate_context, target_role_description))
 
     if not ratings:
         log.error("search_agent.screen_pool: no postings could be rated; keeping the pool unscreened.")
