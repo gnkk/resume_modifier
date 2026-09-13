@@ -33,13 +33,12 @@ if not FIRECRAWL_API_KEY:
 # with adaptive thinking on (see agents/judge.py) since its evaluations are
 # the pipeline's quality gate.
 #
-# Everything the search side does runs on Haiku, but as FOUR separate
+# Everything the search side does runs on Haiku, but as separate
 # constants rather than one. They were a single MODEL_SEARCH until the
 # screening pass and the JD extractor were added, at which point both
-# inherited Haiku by default rather than by decision — and the four jobs
-# are not equivalent. Splitting them costs nothing (all four still point at
-# Haiku, so behaviour is unchanged) and makes the interesting one testable
-# on its own.
+# inherited Haiku by default rather than by decision — and the jobs are
+# not equivalent. Splitting them made each testable on its own, which is
+# how MODEL_PLANNER came to be promoted below.
 _HAIKU = "claude-haiku-4-5-20251001"
 _SONNET = "claude-sonnet-5"
 
@@ -47,9 +46,16 @@ MODEL_CONTEXT = _SONNET   # reads resume PDF + (later) GitHub context
 MODEL_WRITER = _SONNET    # drafts/revises resume content
 MODEL_JUDGE = _SONNET     # judges job matches and resume drafts, thinking on
 
-# Plans the search angles. Mechanical: turn a background into a handful of
-# job titles and locations.
-MODEL_PLANNER = _HAIKU
+# Plans the search angles. ON SONNET, despite being a small, once-per-run
+# call — because it is the narrowest channel in the pipeline and the only
+# stage whose mistakes are completely invisible. Its angles determine the
+# entire scrape: a posting titled something the planner didn't think of is
+# never fetched, so BM25 cannot rank it, the screener cannot rate it, and
+# nothing downstream can know it existed. That used to be survivable — the
+# selection agent could re-explore and had a one-per-run escape hatch to
+# scrape again — but both are gone, so there is now no recovery path at
+# all. One call per run makes this the cheapest quality purchase here.
+MODEL_PLANNER = _SONNET
 
 # Extracts title/company/location/URL from a supplied job description.
 # The most mechanical call in the project — it is told to return null
@@ -131,28 +137,44 @@ JOBSPY_COUNTRY_INDEED = "Canada"
 # on every judge cycle instead of re-scraping. Re-running near-identical
 # queries was returning near-identical postings, so cycles 2 and 3 were paying
 # full scrape cost to rediscover what cycle 1 already had.
-JOB_POOL_TARGET_SIZE = 50  # postings to gather across all angles, after dedupe
+# --- Pool construction ---
+# Three stages narrow the pool, each doing something the previous cannot:
+#
+#   scrape  -> JOB_SCRAPE_CEILING postings from JobSpy across all angles
+#   BM25    -> lexical rank against the resume, keep BM25_KEEP
+#   screen  -> a model rates each survivor 1-10, drops below POOL_SCREEN_MIN_FIT
+#
+# BM25 is cheap and deterministic but blind to meaning: it cannot see
+# seniority, work authorization, or contract-vs-permanent, all of which are
+# short common phrases that score near zero lexically. It is therefore only
+# a coarse pre-filter ('is this my field at all'), never the decider. The
+# screener is what catches the disqualifiers.
+JOB_SCRAPE_CEILING = 200
 
-# The pool is now over-collected and then screened down, rather than filled
-# first-come until the target is hit. Scraping stops at
-# JOB_POOL_TARGET_SIZE * JOB_POOL_OVERSCAN_FACTOR postings; a screening pass
-# then rates each one against the candidate and keeps the best
-# JOB_POOL_TARGET_SIZE. Without this, the pool was whatever the first couple
-# of angles happened to return — later angles often never ran at all, and a
-# posting's position in it said nothing about fit, which pushed all the
-# filtering work downstream onto the judge.
-JOB_POOL_OVERSCAN_FACTOR = 3
+# Postings surviving the BM25 cut. Sized so the screening pass costs LESS
+# than it did before this stage existed (3 batches instead of 6), which is
+# what pays for the larger snippet below.
+BM25_KEEP = 75
 
-# Screening rates each posting 1-5 for fit with the candidate. Postings below
-# this are dropped from the pool entirely rather than left for the selection
-# agent to wade through. 3 = "plausible"; raise to 4 for a tighter pool if
-# the market is rich enough to support it.
-POOL_SCREEN_MIN_FIT = 3
+# Screener rating floor, on a 1-10 scale. Everything below is dropped
+# outright. Survivors are all kept — there is no target pool size, because
+# nothing reads the pool wholesale and truncating a ranked list only costs
+# depth on the last judge cycle, which is exactly when depth is needed.
+# NOTE: this is a judgement call, not a conversion of the old 3-of-5 floor.
+# Watch the drop counts in the first runs.
+POOL_SCREEN_MIN_FIT = 5
 
-# Postings per screening call. Small enough that the model reads each snippet
-# properly rather than skimming a wall of them; large enough to keep the pass
-# to a handful of calls.
+# Postings per screening call. Small enough that the model reads each
+# snippet properly rather than skimming a wall of them.
 POOL_SCREEN_BATCH_SIZE = 25
+
+# How much of each posting the screener sees. Raised from 700 because the
+# BM25 cut halved the number of postings screened: at 700 chars the model
+# saw roughly the opening paragraph, which shows seniority but rarely the
+# requirements block where work authorization, licence and employment-type
+# blockers actually live. Not the full text — postings run 5-10k chars and
+# 25 of those is a wall the model skims rather than reads.
+POOL_SCREEN_SNIPPET_CHARS = 2000
 
 # Fetch each LinkedIn posting's full description during the pool build. Costs
 # one extra request per LinkedIn result, which was too expensive when every
@@ -166,6 +188,12 @@ JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS = True
 # wants remote and the pool is entirely on-site). Without this, a pool that was
 # wrong from the start guarantees two more bad picks; ungated, it degenerates
 # back into re-searching every cycle.
+# NO LONGER USED. This was the selection agent's escape hatch: one extra
+# scrape per run, for when the judge raised a concern nothing in the pool
+# could satisfy. The selection agent is gone (code now walks the screened
+# ranking), so nothing can invoke it. Kept here only as a marker of what
+# was removed — if a pool that is wrong from the start turns out to be a
+# real problem in practice, this is the capability to restore.
 MAX_EXTRA_SEARCHES = 1
 
 # --- Firecrawl (support tool: fallback web search + single-URL scraping) ---

@@ -35,7 +35,7 @@ import anthropic
 from config import ANTHROPIC_API_KEY, MODEL_CONTEXT
 from tools.pdf_reader import read_pdf, PDF_READER_TOOL_SCHEMA
 from tools.text_reader import read_text_file, TEXT_READER_TOOL_SCHEMA
-from logger_setup import get_logger
+from logger_setup import get_logger, note_model
 
 log = get_logger(__name__)
 
@@ -221,6 +221,8 @@ def gather_candidate_context(
                 f"context_agent: failed to reach the Anthropic API ({exc}). "
                 "Check your ANTHROPIC_API_KEY and network connection."
             ) from exc
+
+        note_model(log, "context agent", response)
 
         if response.stop_reason != "tool_use":
             text_blocks = [b.text for b in response.content if b.type == "text"]

@@ -35,7 +35,7 @@ import anthropic
 from config import ANTHROPIC_API_KEY, MODEL_JD_EXTRACT
 from tools.firecrawl_tool import scrape as firecrawl_scrape, is_blocked_domain
 from tools.jobspy_tool import fetch_linkedin_description, linkedin_job_id
-from logger_setup import get_logger
+from logger_setup import get_logger, note_model
 
 log = get_logger(__name__)
 
@@ -264,6 +264,7 @@ def job_from_description(
         log.info("  Warning: could not extract posting metadata (%s). Continuing with the raw text.", exc)
         return fallback
 
+    note_model(log, "jd extractor", response)
     raw_text = "\n".join(b.text for b in response.content if b.type == "text").strip()
     parsed = _parse_json(raw_text)
     if parsed is None:

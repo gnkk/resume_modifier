@@ -39,7 +39,7 @@ import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL_JUDGE, JUDGE_APPROVAL_SCORE, RESUME_APPROVAL_SCORE, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES
 from agents.market_context import MARKET_CALIBRATION
-from logger_setup import get_logger
+from logger_setup import get_logger, note_model
 
 log = get_logger(__name__)
 
@@ -274,6 +274,7 @@ def review_job(job: dict, candidate_context: str) -> dict:
             "Check your ANTHROPIC_API_KEY and network connection."
         ) from exc
 
+    note_model(log, "job judge", response)
     raw_text = _extract_text(response, "judge.review_job")
 
     result = _parse_review_json(raw_text)
@@ -329,6 +330,21 @@ You may be shown the earlier stage's job review, listing limitations \
 already known and accepted when this job was chosen. Those are settled. \
 Do not re-raise them as gaps, do not score against them, and do not \
 withhold approval over them.
+
+THE TRAILING "NOTES" SECTION IS EXPECTED. The writer is instructed to \
+end its output with a section headed "Notes (not part of the resume)", \
+listing real gaps between the candidate and the posting. That section is \
+DELIBERATE and is stripped automatically before the PDF is rendered — it \
+never reaches an employer, and it is displayed separately for the \
+candidate as interview preparation. Do NOT treat its presence as \
+contamination, a formatting defect, or a template-fidelity failure; do \
+NOT deduct for it; do NOT tell the writer to remove it; and do NOT \
+withhold approval over it. A draft is submission-ready WITH that section \
+attached. Read it — it tells you whether the writer flagged gaps honestly \
+rather than burying them, which is a point in the draft's favour — but \
+judge the resume body above it. The one thing worth raising about Notes \
+is if the section is truncated mid-sentence, which means the response was \
+cut off and the resume body may be incomplete too.
 
 Assess:
 1. Fitness of the draft, 1-10, on the ceiling-relative basis described \
@@ -511,6 +527,7 @@ def review_resume(
             "Check your ANTHROPIC_API_KEY and network connection."
         ) from exc
 
+    note_model(log, "resume judge", response)
     raw_text = _extract_text(response, "judge.review_resume")
 
     result = _parse_review_json(raw_text)

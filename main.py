@@ -28,17 +28,18 @@ Pipeline (two independent, SEQUENTIAL judge loops):
     1. Context agent        -> reads the real resume PDF (+ GitHub MCP context, once GITHUB_PAT
                                 is set, + an optional job description .txt). The sample/template
                                 resume is NOT read here — it goes straight to the writer.
-    2. Search <-> Judge      -> search agent proposes a single best-matching job
-                                (JobSpy across LinkedIn/Indeed as the primary tool, with
-                                Firecrawl as fallback support, restricted to postings from
-                                the past two weeks, with anything already selected in an
-                                earlier run filtered out); the judge evaluates ONLY that job pick
-                                (match quality + link trustworthiness). If not approved,
-                                the search agent tries again with the judge's feedback and
-                                the rejected pick excluded. Runs for up to
-                                MAX_JOB_SEARCH_CYCLES cycles, or until the judge approves
-                                early — whichever comes first. Nothing else happens until
-                                this stage finishes.
+    2. Search <-> Judge      -> the pool is scraped once, BM25-ranked against the resume,
+                                then screened by a model that rates every survivor 1-10 and
+                                drops the duds (JobSpy across LinkedIn/Indeed as the primary
+                                tool, restricted to postings from the past two weeks, with
+                                anything already selected in an earlier run filtered out).
+                                Code then walks that ranking: the best remaining posting goes
+                                to the judge with its full description attached, and the judge
+                                evaluates ONLY that pick (match quality + link
+                                trustworthiness). If not approved, the next posting down is
+                                tried. Runs for up to MAX_JOB_SEARCH_CYCLES cycles, until the
+                                judge approves, or until the pool is exhausted. Nothing else
+                                happens until this stage finishes.
     3. Writer <-> Judge      -> only once a job is locked in from stage 2: the writer
                                 drafts an ATS-ready resume for that job, following the
                                 sample/template resume's raw text verbatim as its layout
@@ -91,7 +92,7 @@ configure_logging()
 log = get_logger(__name__)
 
 from agents.context_agent import gather_candidate_context
-from agents.search_agent import build_job_pool, select_best_job
+from agents.search_agent import build_job_pool, next_candidate
 from agents.writer import draft_resume, revise_resume
 from agents.judge import review_job, review_resume
 from agents.jd_agent import (
@@ -110,7 +111,7 @@ from config import (
     MAX_JOB_SEARCH_CYCLES,
     MAX_RESUME_REVISE_CYCLES,
     SAMPLE_RESUME_PATH,
-    JOB_POOL_TARGET_SIZE,
+    JOB_SCRAPE_CEILING,
     MIN_VIABLE_JOB_SCORE,
 )
 
@@ -203,7 +204,7 @@ def run_job_search_loop(
         and matters more now that the judge holds a firm approval bar:
         exhausting all three cycles is a normal outcome, not a rare one.)
     """
-    log.info("  Building job pool (target %d postings, one scraping pass)...", JOB_POOL_TARGET_SIZE)
+    log.info("  Building job pool (scrape ceiling %d, one scraping pass)...", JOB_SCRAPE_CEILING)
     pool = build_job_pool(candidate_context, target_role)
 
     _save_job_pool(pool, run_ts)
@@ -230,46 +231,44 @@ def run_job_search_loop(
         )
 
     history = []
-    rejected = []
     best = None  # (score, cycle, job, review)
-    extra_searches_used = 0
+    rejected_urls: set[str] = set()
 
     for cycle in range(1, MAX_JOB_SEARCH_CYCLES + 1):
-        if cycle == 1:
-            log.info("  [job cycle 1/%d] Selecting best job from pool...", MAX_JOB_SEARCH_CYCLES)
-        else:
+        log.info(
+            "  [job cycle %d/%d] Taking the next posting from the pool...",
+            cycle, MAX_JOB_SEARCH_CYCLES,
+        )
+        job = next_candidate(pool, rejected_urls)
+
+        if job is None:
+            # Fewer surviving postings than cycles. Not a failure: the
+            # pool was simply worked through, and the best-scoring pick so
+            # far is still the right answer.
             log.info(
-                "  [job cycle %d/%d] Selecting a different job from pool against judge feedback...",
-                cycle, MAX_JOB_SEARCH_CYCLES,
+                "  Pool exhausted after %d cycle(s) — no postings left to try.",
+                cycle - 1,
+            )
+            break
+
+        log.info("    -> %s at %s", job.get("job_title"), job.get("company"))
+        if not job.get("full_requirements"):
+            log.info(
+                "    Warning: no description text available for this posting. The "
+                "judge and writer will be working from almost nothing."
             )
 
-        job, extra_searches_used = select_best_job(
-            pool,
-            candidate_context,
-            target_role,
-            rejected_jobs=rejected or None,
-            extra_searches_used=extra_searches_used,
-        )
-
-        if not job.get("url"):
-            log.info("    Warning: the selection agent could not identify a job posting.")
-            log.info("    Notes: %s", job.get("search_notes"))
-            if job.get("raw_response"):
-                log.info("    --- raw model response (for debugging) ---")
-                log.info("    %s", job["raw_response"].replace("\n", "\n    ")[:2000])
-                log.info("    --- end raw response ---")
-
-        log.info("  [job cycle %d/%d] Judge reviewing job pick...", cycle, MAX_JOB_SEARCH_CYCLES)
+        log.info("  [job cycle %d/%d] Judge reviewing the pick...", cycle, MAX_JOB_SEARCH_CYCLES)
         review = review_job(job, candidate_context)
-        history.append({"cycle": cycle, "job": job, "review": review})
 
         job_score = review.get("job_match_score")
         approved = review.get("approved", False)
         log.info(
-            "    -> %s at %s | job match: %s/10, approved: %s%s",
-            job.get("job_title"), job.get("company"), job_score, approved,
-            f" | {review.get('job_match_summary')}" if review.get("job_match_summary") else "",
+            "    -> job match: %s/10 | approved: %s | %s",
+            job_score, approved, review.get("job_match_summary", ""),
         )
+
+        history.append({"cycle": cycle, "job": job, "review": review})
 
         # An unparseable review has no score; rank it below every real one
         # rather than letting it win by default.
@@ -280,25 +279,33 @@ def run_job_search_loop(
         if approved:
             return job, review, history, len(pool)
 
-        if cycle == MAX_JOB_SEARCH_CYCLES:
-            if best[1] != cycle:
-                log.info(
-                    "  No job pick was approved — keeping the best-scoring pick "
-                    "(cycle %d, %s/10) over the final one (cycle %d, %s/10).",
-                    best[1], best[0] if best[0] >= 0 else "unscored",
-                    cycle, job_score if job_score is not None else "unscored",
-                )
-            else:
-                log.info(
-                    "  No job pick was approved — the final pick (cycle %d) was also "
-                    "the best-scoring, keeping it.",
-                    cycle,
-                )
-            return best[2], best[3], history, len(pool)
+        if job.get("url"):
+            rejected_urls.add(job["url"])
 
-        rejected.append({"job": job, "review": review})
+    if best is None:
+        # The pool was empty of usable postings from the first cycle.
+        return (
+            {
+                "job_title": None, "company": None, "location": None, "url": None,
+                "posted_date": None, "full_requirements": None, "match_rationale": None,
+                "search_notes": "No posting in the pool could be put to the judge.",
+            },
+            {
+                "job_match_score": None,
+                "job_match_summary": "No posting was available to review.",
+                "job_link_trustworthy": None,
+                "job_concerns": [],
+                "approved": False,
+            },
+            history,
+            len(pool),
+        )
 
-    # Unreachable given the loop above, but keeps type-checkers happy.
+    log.info(
+        "  No job pick was approved — keeping the best-scoring pick "
+        "(cycle %d, %s/10).",
+        best[1], best[0] if best[0] >= 0 else "unscored",
+    )
     return best[2], best[3], history, len(pool)
 
 

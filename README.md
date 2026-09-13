@@ -24,29 +24,56 @@ critically reviews its own work before you see the output. It runs in
    your background — varying job title, seniority and location, since
    employers title the same work differently.
 2. Those angles run against **JobSpy**, which scrapes LinkedIn and
-   Indeed directly via purpose-built per-site scrapers. Scraping
-   deliberately **over-collects** (up to `JOB_POOL_TARGET_SIZE ×
-   JOB_POOL_OVERSCAN_FACTOR`, ~150 postings) so every planned angle
-   actually runs.
+   Indeed directly. Scraping deliberately **over-collects** (up to
+   `JOB_SCRAPE_CEILING`, ~200 postings) so every planned angle actually
+   runs.
 3. Postings already targeted in earlier runs are **filtered out** (see
    "Duplicate filtering" below).
-4. A **screening pass** (Haiku) rates every remaining posting 1-5 for
-   fit, drops anything below `POOL_SCREEN_MIN_FIT`, and keeps the best
-   `JOB_POOL_TARGET_SIZE`. Without this the pool was simply whatever
-   the earliest angles happened to return.
-5. A **selection agent** (Haiku) queries that pool, reads the full text
-   of its shortlist, checks for hard blockers, and recommends one
-   posting.
-6. The **judge** (Sonnet 5, adaptive thinking at high effort) scores
-   that pick 1-10 against an anchored rubric and approves only at
-   `JUDGE_APPROVAL_SCORE` or above with a working-looking application
-   link. The bar is enforced in code, not just in the prompt.
-7. On rejection, the selector must return a **different** posting
-   addressing the judge's concerns. Up to `MAX_JOB_SEARCH_CYCLES`
-   cycles; if none is approved, the **best-scoring** pick is kept.
-8. If the best pick scores below `MIN_VIABLE_JOB_SCORE`, or nothing
+4. **BM25** ranks what remains against your resume and keeps the top
+   `BM25_KEEP` (~75). Pure lexical arithmetic — no model, no embeddings.
+   It answers "is this even my field?" cheaply and nothing more: it is
+   structurally blind to seniority, work authorization and
+   contract-vs-permanent, which is why it only ever pre-filters.
+5. A **screening pass** (Haiku) rates every survivor 1-10 and drops
+   anything below `POOL_SCREEN_MIN_FIT`. This is where the disqualifiers
+   get caught — a staff-level posting is a near-perfect lexical match to
+   a mid-level candidate, so BM25 ranks it first and the screener rates
+   it a 2. Each posting is rated independently, never against the others
+   in its batch, so ratings stay comparable across batches and cycles.
+   It reads a `POOL_SCREEN_SNIPPET_CHARS` slice of each posting, and that
+   slice is **reordered requirements-first** (see "Requirements-first
+   extraction" below) so the budget is spent on the text that decides
+   whether you'd be screened out rather than on a company mission
+   statement.
+6. Survivors are sorted by **rating first, BM25 rank as tie-break**, and
+   all of them are kept. There is no target pool size: nothing reads the
+   pool wholesale, so truncating a ranked list only costs depth on the
+   last cycle — exactly when it's needed.
+7. **Code** takes the best remaining posting, attaches its full
+   description, and hands it to the **judge** (Sonnet 5, adaptive
+   thinking at high effort), which scores it 1-10 against an anchored
+   rubric and approves only at `JUDGE_APPROVAL_SCORE` or above with a
+   working-looking application link. The bar is enforced in code.
+8. On rejection, the next posting down is tried. Up to
+   `MAX_JOB_SEARCH_CYCLES` cycles, or until the pool runs out; if none is
+   approved, the **best-scoring** pick is kept.
+9. If the best pick scores below `MIN_VIABLE_JOB_SCORE`, or nothing
    survived filtering, **the run stops here** and writes a report
    instead of a resume (see "When a run stops early").
+
+> **Why there is no selection agent.** Step 7 used to be a tool-use
+> agent that queried the pool, read a few postings and picked one. Given
+> a pool that is already rated and ranked, it was re-deriving — three
+> times per run, with no memory between cycles — an ordering the screener
+> had already computed once. Worse, its two most important behaviours
+> ("read the full description before committing", "never re-recommend a
+> rejected posting") were prompt instructions a model could silently
+> skip; both are now code. What was lost: it could respond to a judge
+> concern by jumping to a different *kind* of posting rather than the
+> next one down, and it had a one-per-run escape hatch to scrape again
+> when the pool genuinely couldn't satisfy a concern. If rejections turn
+> out to cluster on one reason, the fix is a reason-driven skip in
+> `next_candidate()`, not restoring the agent.
 
 **Supplied-job mode** (third argument given): none of the above runs.
 The posting is fetched or read, parsed into the same shape, and the
@@ -191,10 +218,13 @@ Everything lands in `data/output/`, timestamped per run:
 - `logs/run_<ts>.log` — full run log
 
 **The PDF carries resume content and nothing else** — no notes, no page
-numbers, no commentary. The writer's "Notes (not part of the resume)"
-section, which flags real gaps between you and the posting, is stripped
-from the PDF and rendered on the review page instead. It's interview
-preparation, not something to send an employer.
+numbers, no commentary. The writer is instructed to end its draft with a
+"Notes (not part of the resume)" section flagging real gaps between you
+and the posting; that section is stripped before the PDF is rendered and
+displayed on the review page instead. It's interview preparation, not
+something to send an employer. The resume judge is told the section is
+expected and auto-stripped, so it doesn't read a deliberate handoff as
+contamination and reject an otherwise fine draft over it.
 
 ### When a run stops early
 
@@ -205,6 +235,38 @@ preparation, not something to send an employer.
 - `job_unavailable_<ts>.html` — a supplied posting couldn't be fetched
   or read. Carries the fetch error verbatim including its workaround.
   **Exits 1** — this needs you to act.
+
+## Requirements-first extraction
+
+The screener reads a fixed-size slice of each posting. Plain head
+truncation spends that budget on whatever the employer put first — often
+a mission statement — while the text that decides whether you'd be
+screened out sits further down. `tools/posting_sections.py` splits the
+posting into sections, scores each heading, and rebuilds the slice as
+**head of posting → requirements → responsibilities**, dropping benefits,
+culture, EEO, application instructions and anything marked "nice to
+have" or "preferred".
+
+Responsibilities are kept, ranked below requirements rather than
+excluded — they're how a posting gets caught whose requirements list your
+whole stack while the actual day-to-day is a different discipline.
+
+Headings are the least reliable text in a posting, so this is built to
+fail safe. It recognises markdown headers, bold lines, ALL-CAPS, trailing
+colons, and bare Title-Case lines (which is how scraped postings usually
+arrive once formatting is stripped). When no requirements section is
+recognised, it falls back to plain head truncation — never an empty
+string — and every run logs the hit rate:
+
+```
+requirements section found in 58 of 75 posting(s); the rest got plain head truncation.
+```
+
+**That number is how you decide whether to keep this layer.** A low hit
+rate means it's mostly falling back and is costing complexity for little;
+the honest move then is to delete it and let the screener find the
+requirements itself, which is what a language model reading 2,000
+characters is actually good at.
 
 ## Duplicate filtering
 
@@ -291,26 +353,38 @@ Several places log a detailed `error` for the record and then a
 plain-language `info` warning for whoever's watching. Both land in the
 file, so a handled failure appears twice. That's redundancy, not a bug.
 
+Every stage also logs the **resolved** model that served it, once per
+run:
+
+```
+[planner ran on claude-sonnet-5-...]
+[screener ran on claude-haiku-4-5-20251001]
+```
+
+Model strings in `config.py` are aliases, so this is what makes
+run-to-run differences attributable: when two runs of identical code
+produce different angles or ratings, the log says whether they ran on the
+same thing, rather than leaving "the model changed underneath me" as an
+untestable explanation sitting next to "my prompt edit worked". It's the
+reason not to pin model strings — pinning buys the same attribution but
+makes deprecation tracking your problem.
+
 ## Model routing
 
-In `config.py`. Sonnet 5 where output quality directly matters; Haiku
-for the search side, split across **four separate constants** so each
-can be promoted independently:
+In `config.py`. Sonnet 5 where a mistake is unrecoverable; Haiku where
+the work is mechanical or a wrong call gets caught downstream.
 
 | Constant | Model | Job |
 |---|---|---|
 | `MODEL_CONTEXT` | Sonnet 5 | Reads the resume PDF. Everything downstream sees only its summary, so anything it drops is unrecoverable. |
 | `MODEL_WRITER` | Sonnet 5 | Drafts and revises the resume. |
 | `MODEL_JUDGE` | Sonnet 5 | Both judges, with adaptive thinking at high effort. |
-| `MODEL_PLANNER` | Haiku 4.5 | Designs the search angles. |
+| `MODEL_PLANNER` | Sonnet 5 | Designs the search angles. The narrowest channel in the pipeline — a posting titled something it didn't think of is never scraped, and with the selection agent gone there is no recovery path. One call per run. |
 | `MODEL_SCREENER` | Haiku 4.5 | Rates and drops postings. **Watch this one** — its drops are permanent and invisible. |
-| `MODEL_SELECTOR` | Haiku 4.5 | Picks the posting to put before the judge. |
 | `MODEL_JD_EXTRACT` | Haiku 4.5 | Pulls metadata from a supplied description. |
 
-If the pool starts coming back wrong, promote `MODEL_SCREENER` first —
-but note it runs across ~150 postings per run, so the cost difference is
-real. If picks keep getting rejected for reasons visible in the posting
-text, promote `MODEL_SELECTOR`.
+If the pool starts coming back wrong, promote `MODEL_SCREENER` — but note
+it runs across ~75 postings per run, so the cost difference is real.
 
 Nothing escalates automatically. A run that screens badly produces a
 thin pool and says so in the log; promotion is a deliberate edit.
@@ -335,10 +409,14 @@ All in `config.py`.
   reliably 403s JobSpy. A circuit breaker drops any site that proves
   blocked for the rest of the run.
 - `JOBSPY_COUNTRY_INDEED` (`"Canada"`)
-- `JOB_POOL_TARGET_SIZE` (50), `JOB_POOL_OVERSCAN_FACTOR` (3)
-- `POOL_SCREEN_MIN_FIT` (3), `POOL_SCREEN_BATCH_SIZE` (25)
-- `MAX_EXTRA_SEARCHES` (1) — the selector's escape hatch, for when the
-  judge's concern genuinely can't be satisfied from the pool
+- `JOB_SCRAPE_CEILING` (200) — postings scraped before ranking
+- `BM25_KEEP` (75) — survivors of the lexical cut
+- `POOL_SCREEN_MIN_FIT` (5, on a 1-10 scale), `POOL_SCREEN_BATCH_SIZE` (25)
+- `POOL_SCREEN_SNIPPET_CHARS` (2000) — how much of each posting the
+  screener reads. Raised from 700 once BM25 halved the number screened;
+  at 700 the model saw the opening paragraph but rarely the requirements
+  block where blockers live.
+- `MAX_EXTRA_SEARCHES` — **no longer used**, see config.py
 
 **Resume**
 - `RESUME_MAX_PAGES` (3), `RESUME_PREFERRED_PAGES` (2)
@@ -361,8 +439,8 @@ off until you set `GITHUB_PAT` in `.env` — no code changes needed:
 resume-agent/
 ├── agents/
 │   ├── context_agent.py   # reads the resume PDF (+ optional GitHub MCP)
-│   ├── market_context.py  # shared job-market calibration, imported by 4 agents
-│   ├── search_agent.py    # plan angles -> scrape -> screen -> select
+│   ├── market_context.py  # shared job-market calibration, imported by 3 agents
+│   ├── search_agent.py    # plan angles -> scrape -> BM25 -> screen -> walk the ranking
 │   ├── jd_agent.py        # supplied-job mode: fetch/parse one posting
 │   ├── writer.py          # drafts + revises the ATS-ready resume
 │   └── judge.py           # review_job() for stage 1, review_resume() for stage 2
@@ -370,6 +448,8 @@ resume-agent/
 │   ├── pdf_reader.py      # PDF text extraction
 │   ├── text_reader.py     # plain .txt reading
 │   ├── jobspy_tool.py     # PRIMARY search; also single LinkedIn posting fetch
+│   ├── bm25_tool.py       # lexical pre-filter: rank the scrape against the resume
+│   ├── posting_sections.py # reorder a posting requirements-first for the screener
 │   └── firecrawl_tool.py  # SUPPORT: fallback search + single-URL scraping
 ├── job_history.py         # cross-run ledger of selected jobs
 ├── html_renderer.py       # review page + early-stop report pages
@@ -412,13 +492,14 @@ quality are evaluative, multi-factor calls, not generation tasks.
   thinking adds reasoning tokens (billed as output) at both stages.
   Worst case is 3 + 3 judge calls plus the corresponding search and
   writer calls.
-- The screening pass adds ~6 Haiku calls per search run.
-- The overscan means ~150 postings scraped instead of 50. JobSpy adds no
+- The screening pass adds ~3 Haiku calls per search run (75 postings in
+  batches of 25). BM25 costs nothing — it's local arithmetic.
+- The overscan means ~200 postings scraped instead of 50. JobSpy adds no
   API cost, but `JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS` costs one extra
   request per LinkedIn result — this is where rate limiting shows up
-  first. Lower `JOB_POOL_OVERSCAN_FACTOR` to 2 if it does. Turning the
-  description fetch off is **not** a fix: the screener reads those
-  snippets and rates everything a cautious 3 without them.
+  first, and 200 is untested. Lower `JOB_SCRAPE_CEILING` if it bites.
+  Turning the description fetch off is **not** a fix: both BM25 and the
+  screener read those descriptions.
 - Supplied-job mode is far cheaper — no pool, no screening, no selection
   cycles.
 - Keep `MODEL_JUDGE` on Sonnet 5 or better. A careful, honest judgment

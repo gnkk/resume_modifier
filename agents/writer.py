@@ -25,7 +25,7 @@ employers, so it's not the place to cut cost.
 import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL_WRITER, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES
-from logger_setup import get_logger
+from logger_setup import get_logger, note_model
 
 log = get_logger(__name__)
 
@@ -307,6 +307,7 @@ def draft_resume(
             "Check your ANTHROPIC_API_KEY and network connection."
         ) from exc
 
+    note_model(log, "writer", response)
     draft = _extract_text(response, "writer.draft_resume")
     if not draft.strip():
         # Fail loudly rather than returning "". An empty draft would otherwise
@@ -388,6 +389,7 @@ def revise_resume(
             "Check your ANTHROPIC_API_KEY and network connection."
         ) from exc
 
+    note_model(log, "writer", response)
     revised = _extract_text(response, "writer.revise_resume")
     if not revised.strip():
         log.error(

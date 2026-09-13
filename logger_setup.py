@@ -133,3 +133,39 @@ def get_run_timestamp() -> str | None:
     if not _CONFIGURED:
         configure_logging()
     return _RUN_TIMESTAMP
+
+
+_MODELS_SEEN: set[tuple[str, str]] = set()
+
+
+def note_model(logger: logging.Logger, stage: str, response) -> None:
+    """
+    Record which model actually served a stage, once per run.
+
+    Every API response carries the RESOLVED model identifier — what an
+    alias like "claude-sonnet-5" pointed at for that particular request.
+    Logging it makes run-to-run differences attributable: when two runs
+    of identical code produce different angles or different ratings, the
+    log answers whether they ran on the same thing, instead of leaving
+    "the model changed underneath me" as an untestable explanation
+    sitting alongside "my prompt edit worked".
+
+    This is the reason not to pin model strings in config. Pinning buys
+    the same attribution but makes deprecation tracking your problem;
+    recording the resolved version costs one log line.
+
+    Deduplicated on (stage, model) so a batched stage like screening
+    doesn't emit the same line once per call. Never raises — a response
+    object without a .model attribute is not worth failing a run over.
+    """
+    try:
+        model = getattr(response, "model", None)
+        if not model:
+            return
+        key = (stage, str(model))
+        if key in _MODELS_SEEN:
+            return
+        _MODELS_SEEN.add(key)
+        logger.info("    [%s ran on %s]", stage, model)
+    except Exception:  # noqa: BLE001 - diagnostics must never break the pipeline
+        pass
