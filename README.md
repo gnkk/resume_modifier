@@ -40,10 +40,11 @@ critically reviews its own work before you see the output. It runs in
    a mid-level candidate, so BM25 ranks it first and the screener rates
    it a 2. Each posting is rated independently, never against the others
    in its batch, so ratings stay comparable across batches and cycles.
-   It reads a `POOL_SCREEN_SNIPPET_CHARS` slice (2,000 chars) of each
-   posting — enough to reach past the opening summary into the
-   requirements block on most postings, though not the whole text. The
-   judge reads the full description before anything is decided.
+   It reads a `POOL_SCREEN_SNIPPET_CHARS` slice of each posting, and that
+   slice is **reordered requirements-first** (see "Requirements-first
+   extraction" below) so the budget is spent on the text that decides
+   whether you'd be screened out rather than on a company mission
+   statement.
 6. Survivors are sorted by **rating first, BM25 rank as tie-break**, and
    all of them are kept. There is no target pool size: nothing reads the
    pool wholesale, so truncating a ranked list only costs depth on the
@@ -235,6 +236,40 @@ contamination and reject an otherwise fine draft over it.
   or read. Carries the fetch error verbatim including its workaround.
   **Exits 1** — this needs you to act.
 
+## Requirements-first extraction
+
+The screener reads a fixed-size slice of each posting. Plain head
+truncation spends that budget on whatever the employer put first — often
+a mission statement — while the text that decides whether you'd be
+screened out sits further down. `tools/posting_sections.py` splits the
+posting into sections, scores each heading, and rebuilds the slice as
+**head of posting → requirements → responsibilities**, dropping benefits,
+culture, EEO, application instructions and anything marked "nice to
+have" or "preferred".
+
+Responsibilities are kept, ranked below requirements rather than
+excluded — they're how a posting gets caught whose requirements list your
+whole stack while the actual day-to-day is a different discipline.
+
+Headings are the least reliable text in a posting, so this is built to
+fail safe. It recognises markdown headers, bold lines, ALL-CAPS, trailing
+colons, and bare Title-Case lines (which is how scraped postings usually
+arrive once formatting is stripped, and was the majority case in
+testing). When no requirements section is recognised, it falls back to
+plain head truncation — never an empty string — and every run logs the
+hit rate:
+
+```
+requirements section found in 58 of 75 posting(s); the rest got plain head truncation.
+```
+
+**That number is how you decide whether to keep this layer.** A low hit
+rate means it's mostly falling back and is costing complexity for little;
+the honest move then is to delete it and let the screener find the
+requirements itself, which is what a language model reading 2,000
+characters is actually good at. Either way the judge still reads the
+full description before anything is decided.
+
 ## Duplicate filtering
 
 Each run's final job pick is appended to `data/output/selected_jobs.json`.
@@ -416,6 +451,7 @@ resume-agent/
 │   ├── text_reader.py     # plain .txt reading
 │   ├── jobspy_tool.py     # PRIMARY search; also single LinkedIn posting fetch
 │   ├── bm25_tool.py       # lexical pre-filter: rank the scrape against the resume
+│   ├── posting_sections.py # reorder a posting requirements-first for the screener
 │   └── firecrawl_tool.py  # SUPPORT: fallback search + single-URL scraping
 ├── job_history.py         # cross-run ledger of selected jobs
 ├── html_renderer.py       # review page + early-stop report pages
