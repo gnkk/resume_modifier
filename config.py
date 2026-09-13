@@ -62,6 +62,12 @@ MODEL_PLANNER = _SONNET
 # rather than infer anything.
 MODEL_JD_EXTRACT = _HAIKU
 
+# Reads the candidate's own resume to determine where they may legally
+# work. Also pure extraction: it is told to report only what the text
+# states and to return an empty list when the resume is silent, which
+# disables location filtering rather than guessing a country.
+MODEL_ELIGIBILITY = _HAIKU
+
 # Rates every scraped posting 1-5 and drops the rest. THE one worth
 # watching: it applies the same market calibration the Sonnet judges use,
 # makes hard-blocker calls, and works from ~700-character snippets in
@@ -151,9 +157,15 @@ JOBSPY_COUNTRY_INDEED = "Canada"
 # screener is what catches the disqualifiers.
 JOB_SCRAPE_CEILING = 200
 
-# Postings surviving the BM25 cut. Sized so the screening pass costs LESS
-# than it did before this stage existed (3 batches instead of 6), which is
-# what pays for the larger snippet below.
+# Postings surviving the BM25 cut. This is the effective pool size — the
+# screener drops the duds from it but nothing truncates further.
+# BM25 still makes a ~62% cut on purely lexical grounds before the
+# screener sees anything, and it cannot see seniority, work
+# authorization, or whether the role is a different discipline — so a
+# posting it misjudges is gone with no model having read it. 75 leaves
+# enough depth that the judge's third cycle still has real choices.
+# Raise this before raising the ceiling: it costs one Haiku call per
+# extra 25, while a bigger scrape costs LinkedIn requests.
 BM25_KEEP = 75
 
 # Screener rating floor, on a 1-10 scale. Everything below is dropped

@@ -9,10 +9,13 @@ critically reviews its own work before you see the output. It runs in
 - **Supplied-job mode** — you give it the posting (a URL or a saved
   description) and it goes straight to writing and reviewing.
 
-> **Status: not yet validated end to end.** The pipeline is complete and
-> every module has been syntax- and import-checked, but no full live run
-> against the Anthropic API has been performed. Treat the first run as a
-> test, and read the run log rather than just the output.
+> **Status: runs end to end, still being tuned.** The search stage has
+> been validated against live data — scraping, BM25 ranking, screening
+> and the judge loop all work. The tuning knobs (`POOL_SCREEN_MIN_FIT`,
+> `BM25_KEEP`, `MIN_VIABLE_JOB_SCORE`) are set from a small number of
+> runs, not from evidence at scale, so read the run log rather than just
+> the output. A run that stops at the viability floor without writing a
+> resume is working as designed, not failing.
 
 ## How it works
 
@@ -28,23 +31,26 @@ critically reviews its own work before you see the output. It runs in
    `JOB_SCRAPE_CEILING`, ~200 postings) so every planned angle actually
    runs.
 3. Postings already targeted in earlier runs are **filtered out** (see
-   "Duplicate filtering" below).
+   "Duplicate filtering" below), as are postings located where you can't
+   legally work (see "Work eligibility" below).
 4. **BM25** ranks what remains against your resume and keeps the top
-   `BM25_KEEP` (~75). Pure lexical arithmetic — no model, no embeddings.
+   `BM25_KEEP` (75). Pure lexical arithmetic — no model, no embeddings.
    It answers "is this even my field?" cheaply and nothing more: it is
    structurally blind to seniority, work authorization and
    contract-vs-permanent, which is why it only ever pre-filters.
-5. A **screening pass** (Haiku) rates every survivor 1-10 and drops
-   anything below `POOL_SCREEN_MIN_FIT`. This is where the disqualifiers
-   get caught — a staff-level posting is a near-perfect lexical match to
-   a mid-level candidate, so BM25 ranks it first and the screener rates
-   it a 2. Each posting is rated independently, never against the others
-   in its batch, so ratings stay comparable across batches and cycles.
-   It reads a `POOL_SCREEN_SNIPPET_CHARS` slice of each posting, and that
-   slice is **reordered requirements-first** (see "Requirements-first
-   extraction" below) so the budget is spent on the text that decides
-   whether you'd be screened out rather than on a company mission
-   statement.
+5. A **screening pass** (Haiku) rates every survivor 1-10, names any hard
+   blocker it finds (`authorization`, `licence`, `degree`, `seniority`,
+   `discipline`), and drops both the blocked postings and anything below
+   `POOL_SCREEN_MIN_FIT`. This is where the disqualifiers get caught — a
+   staff-level posting is a near-perfect lexical match to a mid-level
+   candidate, so BM25 ranks it first and the screener blocks it on
+   seniority. Each posting is rated independently, never against the
+   others in its batch, so ratings stay comparable across batches and
+   cycles. It reads a `POOL_SCREEN_SNIPPET_CHARS` slice of each posting,
+   and that slice is **reordered requirements-first** (see
+   "Requirements-first extraction" below) so the budget is spent on the
+   text that decides whether you'd be screened out rather than on a
+   company mission statement.
 6. Survivors are sorted by **rating first, BM25 rank as tie-break**, and
    all of them are kept. There is no target pool size: nothing reads the
    pool wholesale, so truncating a ranked list only costs depth on the
@@ -270,6 +276,32 @@ requirements itself, which is what a language model reading 2,000
 characters is actually good at. Either way the judge still reads the
 full description before anything is decided.
 
+## Work eligibility
+
+Where you may legally work is a fixed, binary fact, so it's enforced in
+code before any model rates anything — not left to judgement. A Haiku
+call reads your resume for the countries you're authorized in, whether
+you're open to remote, and what the authorization rests on. **Nothing is
+hardcoded to a country**, and if your resume says nothing about work
+authorization the filter returns an empty list and switches itself off
+rather than guessing.
+
+The matching is deliberately conservative: a posting is dropped only when
+its country is confidently outside your eligible set. Anything ambiguous
+is kept and left to the screener and judge, because a wrongly kept
+posting costs a little attention downstream while a wrongly dropped one
+is invisible and gone for the whole run.
+
+The `, CA` collision is the case that forces this. Indeed writes Canadian
+locations as `Toronto, ON, CA` and Californian ones as `San Francisco,
+CA` — the same token, two countries. A province token resolves it when
+present; without one (`Remote, CA`) the posting is kept, because a real
+Canada-remote posting looked exactly like that in a live run.
+
+This exists because a screener rated a Salt Lake City role 10/10 for a
+Canada-only candidate. The judge caught it and scored it 2/10, but that
+cost a full cycle out of three.
+
 ## Duplicate filtering
 
 Each run's final job pick is appended to `data/output/selected_jobs.json`.
@@ -384,9 +416,10 @@ the work is mechanical or a wrong call gets caught downstream.
 | `MODEL_PLANNER` | Sonnet 5 | Designs the search angles. The narrowest channel in the pipeline — a posting titled something it didn't think of is never scraped, and with the selection agent gone there is no recovery path. One call per run. |
 | `MODEL_SCREENER` | Haiku 4.5 | Rates and drops postings. **Watch this one** — its drops are permanent and invisible. |
 | `MODEL_JD_EXTRACT` | Haiku 4.5 | Pulls metadata from a supplied description. |
+| `MODEL_ELIGIBILITY` | Haiku 4.5 | Reads work authorization off the resume. Returns nothing rather than guessing. |
 
-If the pool starts coming back wrong, promote `MODEL_SCREENER` — but note
-it runs across ~75 postings per run, so the cost difference is real.
+If the pool starts coming back wrong, promote `MODEL_SCREENER` — it runs
+across ~75 postings per run, so the cost difference is real but modest.
 
 Nothing escalates automatically. A run that screens badly produces a
 thin pool and says so in the log; promotion is a deliberate edit.
@@ -412,7 +445,9 @@ All in `config.py`.
   blocked for the rest of the run.
 - `JOBSPY_COUNTRY_INDEED` (`"Canada"`)
 - `JOB_SCRAPE_CEILING` (200) — postings scraped before ranking
-- `BM25_KEEP` (75) — survivors of the lexical cut
+- `BM25_KEEP` (75) — survivors of the lexical cut, and the effective
+  pool size. BM25 is the weakest signal in the pipeline, so raise this
+  rather than the ceiling if good matches start going missing.
 - `POOL_SCREEN_MIN_FIT` (5, on a 1-10 scale), `POOL_SCREEN_BATCH_SIZE` (25)
 - `POOL_SCREEN_SNIPPET_CHARS` (2000) — how much of each posting the
   screener reads. Raised from 700 once BM25 halved the number screened;
@@ -442,6 +477,7 @@ resume-agent/
 ├── agents/
 │   ├── context_agent.py   # reads the resume PDF (+ optional GitHub MCP)
 │   ├── market_context.py  # shared job-market calibration, imported by 3 agents
+│   ├── eligibility.py     # work-authorization extraction + location filtering
 │   ├── search_agent.py    # plan angles -> scrape -> BM25 -> screen -> walk the ranking
 │   ├── jd_agent.py        # supplied-job mode: fetch/parse one posting
 │   ├── writer.py          # drafts + revises the ATS-ready resume
@@ -494,14 +530,19 @@ quality are evaluative, multi-factor calls, not generation tasks.
   thinking adds reasoning tokens (billed as output) at both stages.
   Worst case is 3 + 3 judge calls plus the corresponding search and
   writer calls.
+- The writer runs at `effort: "medium"` with a 32,000-token cap, and
+  **streams**. Both matter: `max_tokens` caps thinking and response text
+  together, and at the default high effort the model once spent the
+  entire 16,000-token budget reasoning and returned an empty draft. A
+  cap large enough to prevent that also trips the SDK's non-streaming
+  duration guard, hence the stream.
 - The screening pass adds ~3 Haiku calls per search run (75 postings in
   batches of 25). BM25 costs nothing — it's local arithmetic.
-- The overscan means ~200 postings scraped instead of 50. JobSpy adds no
-  API cost, but `JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS` costs one extra
-  request per LinkedIn result — this is where rate limiting shows up
-  first, and 200 is untested. Lower `JOB_SCRAPE_CEILING` if it bites.
-  Turning the description fetch off is **not** a fix: both BM25 and the
-  screener read those descriptions.
+- Scraping collects up to 200 postings. JobSpy adds no API cost, but
+  `JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS` costs one extra request per
+  LinkedIn result — this is where rate limiting shows up first. Lower
+  `JOB_SCRAPE_CEILING` if it bites. Turning the description fetch off is
+  **not** a fix: both BM25 and the screener read those descriptions.
 - Supplied-job mode is far cheaper — no pool, no screening, no selection
   cycles.
 - Keep `MODEL_JUDGE` on Sonnet 5 or better. A careful, honest judgment

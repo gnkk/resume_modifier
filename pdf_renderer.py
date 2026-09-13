@@ -93,9 +93,9 @@ STYLE = {
     "muted": "#4a4a4a",
     "rule": "#9aa3ab",
 
-    # "center" puts the name/contact block centred over a full-width rule;
-    # "left" stacks it flush left. Match whichever the sample uses.
-    "header_align": "center",
+    # Header block alignment. "left" matches the sample resume: name,
+    # tagline and contact all flush left, no centring.
+    "header_align": "left",
 }
 
 # Page numbers in the bottom margin. Off: the PDF carries resume content
@@ -283,26 +283,47 @@ def _render_header_html(header_md: str) -> str:
     """
     Render the name/tagline/contact block.
 
-    Classifies each paragraph so the CSS can treat them differently: a
-    paragraph that is entirely bold is the professional tagline under the
-    name; everything else is contact detail, set small and muted. Without
-    this every line renders at body size in body colour, which is the
-    single most visible way a rendered Markdown resume looks unfinished.
+    Parsed LINE BY LINE rather than through the Markdown converter,
+    because the writer's output shape here is not dependable. It is
+    instructed to reproduce the template's contact block, and a template
+    whose name is set in caps produces a bare line — 'GOKUL NATH KUNNATH
+    KANDY' with no '#' — which Markdown reads as body text, not a
+    heading. Worse, with nl2br and no blank lines between them the four
+    header lines collapse into ONE paragraph, so nothing downstream can
+    tell the name from the phone number. That shipped a resume with the
+    candidate's name set at 9pt muted grey.
+
+    The structural contract is positional and holds for every shape the
+    writer produces: first line is the name, an optional second line is
+    the professional tagline, everything after is contact detail. A
+    leading '#' is stripped if present, so an h1-style header works too.
     """
-    if not header_md.strip():
+    lines = [line.strip() for line in header_md.splitlines() if line.strip()]
+    if not lines:
         return ""
 
-    html = md_lib.markdown(header_md, extensions=["extra", "nl2br"])
+    def inline(text: str) -> str:
+        """Convert one line's inline Markdown, without the wrapping <p>."""
+        html = md_lib.markdown(text, extensions=["extra"]).strip()
+        return re.sub(r"^<p>(.*)</p>$", r"\1", html, flags=re.DOTALL)
 
-    def classify(match: re.Match) -> str:
-        inner = match.group(1).strip()
-        if re.fullmatch(r"<strong>.*</strong>", inner, re.DOTALL):
-            # Weight is the stylesheet's decision, not the Markdown's.
-            return f'<p class="tagline">{re.sub(r"</?strong>", "", inner)}</p>'
-        return f'<p class="contact">{inner}</p>'
+    name = re.sub(r"^#{1,6}\s*", "", lines[0]).strip()
+    name = re.sub(r"^\*\*(.*)\*\*$", r"\1", name).strip()
+    parts = [f"<h1>{inline(name)}</h1>"]
 
-    html = re.sub(r"<p>(.*?)</p>", classify, html, flags=re.DOTALL)
-    return f'<header class="resume-header">\n{html}\n</header>'
+    rest = lines[1:]
+    # A tagline is a short line of prose. Contact lines carry separators,
+    # an email, or a URL — so anything with those markers is contact,
+    # which keeps a template that omits the tagline from styling its
+    # contact line at tagline size.
+    if rest and not re.search(r"[|@]|https?://|\bwww\.|\.com\b", rest[0]):
+        tagline = re.sub(r"^\*\*(.*)\*\*$", r"\1", rest[0]).strip()
+        parts.append(f'<p class="tagline">{inline(tagline)}</p>')
+        rest = rest[1:]
+
+    parts.extend(f'<p class="contact">{inline(line)}</p>' for line in rest)
+
+    return '<header class="resume-header">\n' + "\n".join(parts) + "\n</header>"
 
 
 def _prepare_html(resume_markdown: str) -> str:
@@ -366,49 +387,61 @@ _RESUME_PDF_TEMPLATE = """<!DOCTYPE html>
     widows: 2;
   }
 
-  /* ---------- Header: name, tagline, contact ---------- */
+  /* ---------- Header: name, tagline, contact ----------
+     Matched to data/input/sample_resume.pdf: flush left, and NO rule under
+     the block. The sample's only horizontal rules sit under the section
+     headings, so adding one here doubled up the dividers and made the
+     header look like a section of its own. */
   .resume-header {
     text-align: %%HEADER_ALIGN%%;
-    padding-bottom: 6pt;
+    padding-bottom: 0;
     margin-bottom: 2pt;
-    border-bottom: 1.1pt solid %%ACCENT%%;
   }
   .resume-header h1 {
     font-family: %%FONT_HEADINGS%%;
+    /* Large, heavy and TIGHTLY tracked — the sample sets an all-caps name
+       at roughly twice body size with normal letter-spacing. Opening the
+       tracking here reads as horizontally stretched, not spacious; the
+       breathing room comes from the margin below. */
     font-size: 20pt;
     font-weight: 700;
-    letter-spacing: 0.015em;
-    line-height: 1.12;
-    margin: 0 0 3pt 0;
+    letter-spacing: 0;
+    line-height: 1.15;
+    margin: 0 0 6pt 0;
     color: %%ACCENT%%;
   }
+  /* Regular weight, not bold: in the sample this line is clearly lighter
+     than the name and only a little larger than the contact text. */
   .tagline {
-    font-size: 10.5pt;
-    font-weight: 600;
-    letter-spacing: 0.015em;
+    font-size: 11.5pt;
+    font-weight: 400;
+    letter-spacing: 0;
     color: %%TEXT%%;
-    margin: 0 0 4pt 0;
+    margin: 0 0 6pt 0;
   }
   .contact {
-    font-size: 9pt;
-    line-height: 1.42;
-    color: %%MUTED%%;
+    font-size: 8.5pt;
+    line-height: 1.5;
+    color: %%TEXT%%;
     margin: 0;
   }
-  .contact + .contact { margin-top: 1.5pt; }
-  .contact a { color: %%MUTED%%; }
+  /* The work-authorization line — last in the block — is italic in the
+     sample, which sets it apart from the contact details above it. */
+  .contact:last-child { font-style: italic; }
+  .contact a { color: %%TEXT%%; }
 
   /* ---------- Section headers ---------- */
+  /* Section headers: navy caps over a navy rule, as in the sample. */
   h2 {
     font-family: %%FONT_HEADINGS%%;
     font-size: 9.8pt;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.11em;
+    letter-spacing: 0.06em;
     color: %%ACCENT%%;
     margin: 12pt 0 5pt 0;
     padding-bottom: 2.5pt;
-    border-bottom: 0.6pt solid %%RULE%%;
+    border-bottom: 0.9pt solid %%ACCENT%%;
     /* Never leave a section header alone at the foot of a page. */
     break-after: avoid;
     page-break-after: avoid;

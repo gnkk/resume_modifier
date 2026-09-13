@@ -158,14 +158,24 @@ gap and suggestion the judge raised, don't just lightly reword the same \
 draft. Preserve what the judge called out as a strength."""
 
 
-# Generous token budget on purpose. A 3-page resume is only ~1,500 tokens of
-# actual output, but Sonnet 5 may spend tokens reasoning before writing, and
-# that reasoning counts against max_tokens — too small a budget gets the model
-# cut off before it emits ANY resume text, yielding an empty draft rather than
-# a short one. There's no cost to headroom that isn't used, and the failure
-# mode without it is silent and expensive (an empty resume flows all the way
-# through the judge loop to the rendered output).
-MAX_OUTPUT_TOKENS = 16000
+# Token budget and thinking effort, set together because they interact.
+#
+# max_tokens is a HARD cap on total output for the request — thinking
+# tokens and response text share it. Sonnet 5 thinks adaptively by
+# default at HIGH effort, and on the first real run that default consumed
+# the entire 16,000-token budget on thinking alone (output_tokens=16000,
+# thinking_tokens=16000) before a single character of resume was written.
+# The draft came back empty and the run aborted.
+#
+# Two changes, per Anthropic's guidance for stop_reason="max_tokens":
+# raise the ceiling AND lower the effort. Medium is the right level here
+# because drafting is a generation task, not an evaluative one — the
+# judge is where deep reasoning earns its cost. A 3-page resume is only
+# ~1,500 tokens of actual output, so 32,000 is almost entirely headroom
+# for thinking; unused headroom costs nothing, while too little of it
+# fails the whole run.
+MAX_OUTPUT_TOKENS = 32000
+WRITER_EFFORT = "medium"
 
 
 def _extract_text(response, where: str) -> str:
@@ -179,8 +189,10 @@ def _extract_text(response, where: str) -> str:
     if not text.strip():
         log.error(
             "%s: model returned no text (stop_reason=%s, usage=%s). If stop_reason "
-            "is 'max_tokens', the budget was exhausted before any resume text was "
-            "written — raise MAX_OUTPUT_TOKENS.",
+            "is 'max_tokens', check usage.output_tokens_details.thinking_tokens: "
+            "when it equals output_tokens, thinking consumed the whole budget "
+            "before any text was written — raise MAX_OUTPUT_TOKENS, lower "
+            "WRITER_EFFORT, or both.",
             where, getattr(response, "stop_reason", "unknown"), getattr(response, "usage", None),
         )
     elif getattr(response, "stop_reason", None) == "max_tokens":
@@ -282,10 +294,17 @@ def draft_resume(
         f"Posting URL: {job.get('url')}\n"
         f"Requirements/responsibilities:\n{job.get('full_requirements')}\n"
     )
+    # Streamed, not a plain create(). The SDK refuses non-streaming
+    # requests whose estimated duration could exceed 10 minutes, and
+    # MAX_OUTPUT_TOKENS is large enough to trip that guard. Streaming
+    # keeps the headroom that stops thinking from consuming the whole
+    # budget; get_final_message() returns the same Message object a
+    # create() call would, so everything downstream is unchanged.
     try:
-        response = client.messages.create(
+        with client.messages.stream(
             model=MODEL_WRITER,
             max_tokens=MAX_OUTPUT_TOKENS,
+            output_config={"effort": WRITER_EFFORT},
             system=SYSTEM_PROMPT,
             messages=[
                 {
@@ -299,7 +318,8 @@ def draft_resume(
                     ),
                 }
             ],
-        )
+        ) as stream:
+            response = stream.get_final_message()
     except anthropic.APIError as exc:
         log.error("writer.draft_resume: Anthropic API call failed: %s", exc, exc_info=True)
         raise RuntimeError(
@@ -362,9 +382,10 @@ def revise_resume(
         f"Specific suggestions to apply: {judge_feedback.get('suggestions')}\n"
     )
     try:
-        response = client.messages.create(
+        with client.messages.stream(
             model=MODEL_WRITER,
             max_tokens=MAX_OUTPUT_TOKENS,
+            output_config={"effort": WRITER_EFFORT},
             system=SYSTEM_PROMPT,
             messages=[
                 {
@@ -381,7 +402,8 @@ def revise_resume(
                     ),
                 }
             ],
-        )
+        ) as stream:
+            response = stream.get_final_message()
     except anthropic.APIError as exc:
         log.error("writer.revise_resume: Anthropic API call failed: %s", exc, exc_info=True)
         raise RuntimeError(

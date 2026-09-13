@@ -71,6 +71,7 @@ from config import (
     SKIP_PREVIOUSLY_SELECTED,
 )
 from agents.market_context import MARKET_CALIBRATION
+from agents.eligibility import extract_work_eligibility, filter_by_location
 from job_history import filter_seen
 from tools.jobspy_tool import search as jobspy_search_fn
 from tools.firecrawl_tool import scrape as firecrawl_scrape_fn
@@ -264,9 +265,27 @@ examined more closely later. Be decisive about the clear cases: a different \
 discipline, or several seniority bands off, should get 1-3 rather than a \
 cautious 5.
 
-Rate every posting in the batch. Respond with ONLY a JSON array, no other \
-text:
-[{{"i": <index>, "fit": <1-10>, "why": "<max 12 words>"}}, ...]"""
+Rate every posting in the batch. Before rating each one, check \
+explicitly whether a HARD BLOCKER applies and name it in the "blocker" \
+field — do not skip this check, and do not rate first and rationalize \
+after. Use exactly one of:
+  "none"          — no hard blocker.
+  "authorization" — needs citizenship, clearance, or sponsorship the \
+candidate does not have; or is located somewhere they cannot work.
+  "licence"       — requires a licence, registration or accreditation \
+they do not hold.
+  "degree"        — states a degree level as a bar that they do not meet.
+  "seniority"     — two or more bands away: staff/principal/director, or \
+a people-management or delivery-lead role, for an individual \
+contributor.
+  "discipline"    — the actual day-to-day is a different job.
+Anything other than "none" forces a fit of 1-2 AND removes the posting \
+from consideration entirely, so use it only for a genuine blocker — \
+never for a soft item.
+
+Respond with ONLY a JSON array, no other text:
+[{{"i": <index>, "fit": <1-10>, "blocker": "<one of the values above>", \
+"why": "<max 12 words>"}}, ...]"""
 
 
 def _screen_batch(
@@ -336,7 +355,12 @@ def _screen_batch(
         except (KeyError, TypeError, ValueError):
             continue
         # Nothing structurally constrains the model's output to 1-10, so clamp.
-        ratings[index] = {"fit": max(1, min(10, fit)), "why": str(entry.get("why") or "")}
+        blocker = str(entry.get("blocker") or "none").strip().lower()
+        ratings[index] = {
+            "fit": max(1, min(10, fit)),
+            "blocker": blocker,
+            "why": str(entry.get("why") or ""),
+        }
     return ratings
 
 
@@ -404,7 +428,7 @@ def screen_pool(
         log.info("  Warning: screening produced no ratings — using the BM25 order instead.")
         return pool
 
-    kept, dropped, unrated = [], 0, 0
+    kept, dropped, unrated, blocked = [], 0, 0, 0
     for index, record in indexed:
         rating = ratings.get(index)
         if rating is None:
@@ -412,6 +436,13 @@ def screen_pool(
             record["fit_note"] = "not screened"
             unrated += 1
             kept.append(record)
+            continue
+        # A named blocker removes the posting regardless of the number the
+        # model attached to it. Belt and braces: the prompt says a blocker
+        # forces 1-2, but the rating and the blocker are separate fields
+        # and only one of them is a considered judgement.
+        if rating["blocker"] not in ("", "none"):
+            blocked += 1
             continue
         if rating["fit"] < POOL_SCREEN_MIN_FIT:
             dropped += 1
@@ -425,8 +456,8 @@ def screen_pool(
     kept.sort(key=lambda r: (-(r.get("fit_rating") or 0), r.get("bm25_rank") or 10**6))
 
     log.info(
-        "  Screened: %d dropped below fit %d, %d unrated, %d kept.",
-        dropped, POOL_SCREEN_MIN_FIT, unrated, len(kept),
+        "  Screened: %d blocked, %d dropped below fit %d, %d unrated, %d kept.",
+        blocked, dropped, POOL_SCREEN_MIN_FIT, unrated, len(kept),
     )
     strong = sum(1 for r in kept if (r.get("fit_rating") or 0) >= 8)
     log.info("  %d posting(s) rated 8+ for fit.", strong)
@@ -517,6 +548,14 @@ def build_job_pool(
     # means neither stage spends anything on it.
     if SKIP_PREVIOUSLY_SELECTED:
         pool = filter_seen(pool)
+
+    # Work authorization is a fixed, binary fact about the candidate, so
+    # it is enforced here rather than left to a model's judgement. On the
+    # run that motivated this, the screener rated a Salt Lake City role
+    # 10/10 for a Canada-only candidate and burned a full judge cycle.
+    # The eligible countries come from the candidate's own resume —
+    # nothing is hardcoded.
+    pool = filter_by_location(pool, extract_work_eligibility(candidate_context))
 
     if not pool:
         return pool
