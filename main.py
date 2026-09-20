@@ -81,9 +81,10 @@ content) — see config.SAMPLE_RESUME_PATH.
 
 import sys
 import os
+import re
 import json
 
-from logger_setup import configure_logging, get_logger, get_log_file_path, get_run_timestamp
+from logger_setup import configure_logging, get_logger, get_log_file_path, get_run_timestamp, log_cache_summary
 
 # Configure logging before any other project module runs its own
 # get_logger(__name__) at import time, so every module's logger is
@@ -103,17 +104,27 @@ from agents.jd_agent import (
 )
 from tools.pdf_reader import read_pdf
 from tools.text_reader import read_text_file
-from html_renderer import render_review_html, render_no_job_html, render_job_unavailable_html
+from html_renderer import (
+    render_review_html,
+    render_no_job_html,
+    render_job_unavailable_html,
+    render_jobs_found_html,
+)
 from pdf_renderer import render_resume_pdf, extract_notes
 from job_history import record_selection
 from config import (
     DATA_OUTPUT_DIR,
+    DATA_WORK_DIR,
     MAX_JOB_SEARCH_CYCLES,
     MAX_RESUME_REVISE_CYCLES,
     SAMPLE_RESUME_PATH,
     JOB_SCRAPE_CEILING,
     MIN_VIABLE_JOB_SCORE,
+    RUN_MODE,
+    JOB_MATCH_COUNT,
+    SUGGESTION_GATE,
 )
+from pending import write_pending
 
 
 def load_style_template(path: str = SAMPLE_RESUME_PATH) -> str | None:
@@ -156,14 +167,14 @@ def _save_job_pool(pool: list[dict], run_ts: str) -> None:
     crash recovery — when a later stage fails, the scrape doesn't have to
     be repeated to see what the agent was choosing between.
 
-    Not to be confused with data/output/selected_jobs.json, which DOES
+    Not to be confused with data/selected_jobs.json, which DOES
     persist across runs — that one holds only each run's final pick, for
     duplicate filtering (see job_history.py).
     """
     if not pool:
         return
-    os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
-    pool_path = os.path.join(DATA_OUTPUT_DIR, f"job_pool_{run_ts}.json")
+    os.makedirs(DATA_WORK_DIR, exist_ok=True)
+    pool_path = os.path.join(DATA_WORK_DIR, f"job_pool_{run_ts}.json")
     try:
         with open(pool_path, "w", encoding="utf-8") as f:
             json.dump(pool, f, indent=2, default=str)
@@ -173,82 +184,62 @@ def _save_job_pool(pool: list[dict], run_ts: str) -> None:
         log.info("  Warning: could not save the job pool (%s). Continuing.", exc)
 
 
-def run_job_search_loop(
+def find_matching_jobs(
     candidate_context: str,
     target_role: str,
     run_ts: str,
-) -> tuple[dict, dict, list[dict]]:
+    want: int = 1,
+) -> tuple[list[dict], list[dict], int]:
     """
-    Build the job pool once, then run the selection <-> judge cycle up to
-    MAX_JOB_SEARCH_CYCLES times, or until the judge approves early.
+    Build the job pool once, then walk it until `want` jobs are worth
+    applying to (or the pool/cycle budget runs out).
 
-    Scraping happens exactly once, before the loop. Each cycle picks a
-    different posting from that pool rather than re-searching — repeated
-    near-identical queries were returning near-identical postings, so
-    re-scraping per cycle bought nothing. No resume is written during
-    this stage; the judge evaluates ONLY the job pick.
+    Scraping happens exactly once, before the loop. Each cycle takes the
+    next posting from the fit-ranked pool rather than re-searching.
+
+    Two acceptance tiers, and the distinction matters. A posting the judge
+    APPROVES is taken immediately. A posting that clears
+    MIN_VIABLE_JOB_SCORE but not the approval bar is held as a fallback
+    and only used to top up at the end — so a run asking for three jobs
+    returns the three best available rather than the first three that were
+    merely good enough, and a run that finds two approved plus one
+    fallback is honest about which is which.
+
+    The cycle budget is MAX_JOB_SEARCH_CYCLES PER job requested. Without
+    that scaling, asking for three jobs from a three-cycle budget would
+    usually return one.
 
     Returns:
-        (final_job, final_job_review, history, pool_size) where history is
-        a list of {"cycle": int, "job": dict, "review": dict} entries and
-        pool_size is the post-filtering pool the cycles drew from — the
-        caller needs it to explain an empty-handed run.
-
-        On early approval, that approved pick is returned. If no cycle is
-        approved, the BEST-SCORING pick is returned rather than the last
-        one — later cycles chase specific judge concerns and can trade a
-        strong overall match for one that merely answers the last
-        complaint, so the final cycle is not reliably the strongest. Every
-        pick is scored by the same judge against the same candidate, so
-        the scores are comparable. (This mirrors run_resume_revise_loop,
-        and matters more now that the judge holds a firm approval bar:
-        exhausting all three cycles is a normal outcome, not a rare one.)
+        (selections, history, pool_size) where selections is a list of
+        {"job": dict, "review": dict, "approved": bool} ordered best
+        first, and history is every posting put to the judge, for the
+        report pages. An empty selections list means nothing cleared the
+        viability floor.
     """
     log.info("  Building job pool (scrape ceiling %d, one scraping pass)...", JOB_SCRAPE_CEILING)
     pool = build_job_pool(candidate_context, target_role)
-
     _save_job_pool(pool, run_ts)
 
     if not pool:
-        # Running three selection cycles against an empty pool costs three
-        # model calls to produce three identical empty results.
+        # Running cycles against an empty pool costs model calls to
+        # produce identical empty results.
         log.info("  The job pool is empty — nothing matched any angle in the window.")
-        return (
-            {
-                "job_title": None, "company": None, "location": None, "url": None,
-                "posted_date": None, "full_requirements": None, "match_rationale": None,
-                "search_notes": "No postings survived scraping, duplicate filtering, and fit screening.",
-            },
-            {
-                "job_match_score": None,
-                "job_match_summary": "No posting was available to review.",
-                "job_link_trustworthy": None,
-                "job_concerns": [],
-                "approved": False,
-            },
-            [],
-            0,
-        )
+        return [], [], 0
 
-    history = []
-    best = None  # (score, cycle, job, review)
-    rejected_urls: set[str] = set()
+    history: list[dict] = []
+    accepted: list[dict] = []
+    fallbacks: list[tuple[float, dict, dict]] = []
+    tried_urls: set[str] = set()
+    budget = MAX_JOB_SEARCH_CYCLES * want
 
-    for cycle in range(1, MAX_JOB_SEARCH_CYCLES + 1):
-        log.info(
-            "  [job cycle %d/%d] Taking the next posting from the pool...",
-            cycle, MAX_JOB_SEARCH_CYCLES,
-        )
-        job = next_candidate(pool, rejected_urls)
+    for cycle in range(1, budget + 1):
+        if len(accepted) >= want:
+            break
 
+        log.info("  [job cycle %d/%d] Taking the next posting from the pool...", cycle, budget)
+        job = next_candidate(pool, tried_urls)
         if job is None:
-            # Fewer surviving postings than cycles. Not a failure: the
-            # pool was simply worked through, and the best-scoring pick so
-            # far is still the right answer.
-            log.info(
-                "  Pool exhausted after %d cycle(s) — no postings left to try.",
-                cycle - 1,
-            )
+            log.info("  Pool exhausted after %d cycle(s) — no postings left to try.", cycle - 1)
             break
 
         log.info("    -> %s at %s", job.get("job_title"), job.get("company"))
@@ -257,56 +248,46 @@ def run_job_search_loop(
                 "    Warning: no description text available for this posting. The "
                 "judge and writer will be working from almost nothing."
             )
+        if job.get("url"):
+            tried_urls.add(job["url"])
 
-        log.info("  [job cycle %d/%d] Judge reviewing the pick...", cycle, MAX_JOB_SEARCH_CYCLES)
         review = review_job(job, candidate_context)
-
-        job_score = review.get("job_match_score")
-        approved = review.get("approved", False)
+        score = review.get("job_match_score")
+        approved = bool(review.get("approved", False))
         log.info(
             "    -> job match: %s/10 | approved: %s | %s",
-            job_score, approved, review.get("job_match_summary", ""),
+            score, approved, review.get("job_match_summary", ""),
         )
-
         history.append({"cycle": cycle, "job": job, "review": review})
 
-        # An unparseable review has no score; rank it below every real one
-        # rather than letting it win by default.
-        score_value = job_score if isinstance(job_score, (int, float)) else -1
-        if best is None or score_value > best[0]:
-            best = (score_value, cycle, job, review)
-
+        score_value = score if isinstance(score, (int, float)) else -1
         if approved:
-            return job, review, history, len(pool)
+            accepted.append({"job": job, "review": review, "approved": True})
+            log.info("    Accepted (%d of %d requested).", len(accepted), want)
+        elif score_value >= MIN_VIABLE_JOB_SCORE:
+            fallbacks.append((score_value, job, review))
 
-        if job.get("url"):
-            rejected_urls.add(job["url"])
-
-    if best is None:
-        # The pool was empty of usable postings from the first cycle.
-        return (
-            {
-                "job_title": None, "company": None, "location": None, "url": None,
-                "posted_date": None, "full_requirements": None, "match_rationale": None,
-                "search_notes": "No posting in the pool could be put to the judge.",
-            },
-            {
-                "job_match_score": None,
-                "job_match_summary": "No posting was available to review.",
-                "job_link_trustworthy": None,
-                "job_concerns": [],
-                "approved": False,
-            },
-            history,
-            len(pool),
+    # Top up with the best unapproved-but-viable picks, strongest first.
+    fallbacks.sort(key=lambda f: f[0], reverse=True)
+    for score_value, job, review in fallbacks:
+        if len(accepted) >= want:
+            break
+        accepted.append({"job": job, "review": review, "approved": False})
+        log.info(
+            "    Filling a slot with an unapproved but viable pick (%s/10): %s at %s.",
+            score_value, job.get("job_title"), job.get("company"),
         )
 
-    log.info(
-        "  No job pick was approved — keeping the best-scoring pick "
-        "(cycle %d, %s/10).",
-        best[1], best[0] if best[0] >= 0 else "unscored",
-    )
-    return best[2], best[3], history, len(pool)
+    if not accepted:
+        log.info("  Nothing in the pool cleared the %s/10 viability floor.", MIN_VIABLE_JOB_SCORE)
+    elif len(accepted) < want:
+        log.info(
+            "  Found %d job(s) worth applying to, short of the %d requested — "
+            "the pool did not hold more that cleared the bar.",
+            len(accepted), want,
+        )
+
+    return accepted, history, len(pool)
 
 
 def run_resume_revise_loop(
@@ -481,50 +462,157 @@ def run_supplied_job_stage(candidate_context: str, job_source: str) -> tuple[dic
     return job, review
 
 
-def _job_viability(job: dict, job_review: dict, pool_size: int) -> tuple[bool, str]:
+def _no_jobs_reason(pool_size: int) -> str:
     """
-    Decide whether this run's best job pick is worth writing a resume for.
+    Explain an empty-handed search, for the no-job page.
 
-    Three outcomes are possible at this point, and only the third should
-    stop the run: an approved pick, an unapproved-but-real match worth
-    applying to, and nothing worth applying to at all. The last case used
-    to flow straight into the writer, which produced a polished, plausible
-    resume for a job the judge had just rated as a poor match — an output
-    that looks like a successful run and shouldn't be sent anywhere. That
-    is worse than no output.
-
-    Returns (is_viable, reason). The reason is written for a human reading
-    the no-job page, not for a log line.
+    find_matching_jobs() already applies the viability floor, so by the
+    time this is called the only question is WHY nothing cleared it.
     """
-    if not job or not job.get("url"):
-        if pool_size == 0:
-            return False, (
-                "No job postings matched this candidate at all. Nothing survived "
-                "scraping, duplicate filtering against earlier runs, and fit "
-                "screening within the search window."
+    if pool_size == 0:
+        return (
+            "No job postings matched this candidate at all. Nothing survived "
+            "scraping, duplicate filtering against earlier runs, work-eligibility "
+            "filtering, and fit screening within the search window."
+        )
+    return (
+        f"Nothing in the {pool_size}-posting pool reached the "
+        f"{MIN_VIABLE_JOB_SCORE}/10 viability floor. Writing a resume for a "
+        "weaker match would produce a polished application for a role this "
+        "candidate is not a real match for, so the run stopped here instead."
+    )
+
+
+def _write_report(path: str, page: str, label: str) -> bool:
+    """Write a rendered HTML report, logging rather than raising on failure."""
+    try:
+        os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page)
+        log.info("  %s: %s", label, path)
+        return True
+    except OSError as exc:
+        log.error("main: could not write %s to %s: %s", label, path, exc, exc_info=True)
+        log.info("  Warning: %s could not be written (%s).", label, exc)
+        return False
+
+
+def _slug(text: str, limit: int = 40) -> str:
+    """
+    Turn a job title or company into something safe for a folder name.
+
+    Kept readable rather than minimal: the folder name is how you find a
+    job's resume months later, and `20260920_164005_1` alone tells you
+    nothing about which application it was.
+    """
+    cleaned = re.sub(r"[^\w\s-]", "", str(text or "")).strip()
+    cleaned = re.sub(r"[\s_-]+", "-", cleaned)
+    return cleaned[:limit].strip("-")
+
+
+def job_folder_name(job: dict, suffix: str) -> str:
+    """
+    The per-job folder inside data/output/.
+
+    Timestamp first so the listing sorts chronologically, then company and
+    title so it is identifiable at a glance:
+        20260920_164005_1_RBC_Senior-Data-Scientist
+    """
+    parts = [suffix, _slug(job.get("company"), 30), _slug(job.get("job_title"))]
+    return "_".join(part for part in parts if part)
+
+
+def render_outputs(
+    final_draft: str,
+    job: dict,
+    job_review: dict,
+    resume_review: dict,
+    job_history: list[dict],
+    resume_history: list[dict],
+    suffix: str,
+    job_supplied: bool,
+) -> None:
+    """
+    Write one job's artifacts.
+
+    WHERE THINGS GO. Each job gets its own folder under data/output/,
+    containing only the two things worth opening: the resume PDF and the
+    review page. The resume Markdown and the review JSON are intermediates
+    — one is the safety net behind the PDF, the other is diagnostics — and
+    go to data/work/ under the same suffix, so a job's folder is a clean
+    pair of files rather than a pile of four formats of the same thing.
+
+    `suffix` distinguishes jobs within a run — plain run timestamp for a
+    single job, timestamp_1/_2/_3 when several were requested.
+
+    Every step past the Markdown degrades rather than raises. By this
+    point the resume content exists; a WeasyPrint library problem or an
+    unserializable value in a review dict should cost you one format, not
+    the run — and with several jobs in flight, not the jobs after it
+    either.
+    """
+    job_dir = os.path.join(DATA_OUTPUT_DIR, job_folder_name(job, suffix))
+    os.makedirs(job_dir, exist_ok=True)
+    os.makedirs(DATA_WORK_DIR, exist_ok=True)
+
+    md_path = os.path.join(DATA_WORK_DIR, f"tailored_resume_{suffix}.md")
+    try:
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(final_draft)
+    except OSError as exc:
+        log.error("main: failed writing resume Markdown to %s: %s", md_path, exc, exc_info=True)
+        raise RuntimeError(f"Could not write resume Markdown to '{md_path}' — {exc}") from exc
+
+    review_path = os.path.join(DATA_WORK_DIR, f"resume_review_{suffix}.json")
+    try:
+        with open(review_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "job": job,
+                    "job_search_stage": {"final_review": job_review, "cycle_history": job_history},
+                    "resume_revise_stage": {"final_review": resume_review, "cycle_history": resume_history},
+                },
+                f, indent=2, default=str,
             )
-        return False, (
-            f"The selection agent could not identify a usable posting from the "
-            f"{pool_size}-posting pool, so nothing reached the judge."
-        )
+    except (OSError, TypeError) as exc:
+        log.error("main: failed writing review JSON to %s: %s", review_path, exc, exc_info=True)
+        log.info("  Warning: could not save the review JSON (%s). Continuing.", exc)
 
-    score = job_review.get("job_match_score")
-    if not isinstance(score, (int, float)):
-        return False, (
-            "The judge could not produce a usable score for the selected posting, "
-            "so there is no basis for writing a resume against it. This usually "
-            "means the review response failed to parse — see the run log."
-        )
+    title = f"{job.get('job_title', 'Tailored Resume')} — {job.get('company', '')}".strip(" —")
 
-    if score < MIN_VIABLE_JOB_SCORE:
-        return False, (
-            f"The best posting found scored {score}/10, below the "
-            f"{MIN_VIABLE_JOB_SCORE}/10 viability floor. Writing a resume for it "
-            "would produce a polished application for a role this candidate is "
-            "not a real match for, so the run stopped here instead."
-        )
+    pdf_path = os.path.join(job_dir, "resume.pdf")
+    pdf_ok = True
+    try:
+        render_resume_pdf(final_draft, pdf_path, title=title)
+    except RuntimeError as exc:
+        log.error("main: PDF rendering failed: %s", exc, exc_info=True)
+        log.info("  Warning: PDF rendering failed (%s). Markdown resume was still saved.", exc)
+        pdf_ok = False
 
-    return True, ""
+    review_html_path = os.path.join(job_dir, "review.html")
+    html_ok = True
+    try:
+        review_html = render_review_html(
+            job_review, resume_review, job,
+            job_cycle_number=len(job_history),
+            max_job_cycles=MAX_JOB_SEARCH_CYCLES,
+            resume_cycle_number=len(resume_history),
+            max_resume_cycles=MAX_RESUME_REVISE_CYCLES,
+            job_supplied=job_supplied,
+            writer_notes=extract_notes(final_draft),
+            title=f"Review — {title}" if title else "Resume & Job Review",
+        )
+        with open(review_html_path, "w", encoding="utf-8") as f:
+            f.write(review_html)
+    except (RuntimeError, OSError) as exc:
+        log.error("main: review HTML rendering/write failed: %s", exc, exc_info=True)
+        log.info("  Warning: review HTML could not be generated (%s).", exc)
+        html_ok = False
+
+    log.info("    Folder:      %s", job_dir)
+    log.info("    PDF:         %s", "resume.pdf" if pdf_ok else "(failed — see warning above)")
+    log.info("    Review:      %s", "review.html" if html_ok else "(failed — see warning above)")
+    log.info("    (working copies: %s, %s)", md_path, review_path)
 
 
 def _validate_inputs(resume_path: str, job_description_path: str | None) -> None:
@@ -549,214 +637,245 @@ def main():
     if len(sys.argv) not in (3, 4):
         print(
             'Usage: python main.py <path_to_resume.pdf> "<target role description>" '
-            "[job URL or path to job_description.txt]"
+            "[job URL or path to job_description.txt]\n"
+            "Environment: RUN_MODE=search|write|both, JOB_MATCH_COUNT=1..3"
         )
         sys.exit(1)
 
     resume_path, target_role = sys.argv[1], sys.argv[2]
-    job_description_path = sys.argv[3] if len(sys.argv) == 4 else None
+    job_source = sys.argv[3] if len(sys.argv) == 4 else None
 
     log_file_path = get_log_file_path()
     run_ts = get_run_timestamp()
     log.info("Logging this run to: %s\n", log_file_path)
 
-    # Two pipelines share this entry point. Supplying a job description
-    # selects the second one: no pool, no search, no selection cycles, and
-    # no viability gate — the job is already decided. Both still run four
-    # stages; only stage 2 differs.
-    job_supplied = bool(job_description_path)
+    # Supplying a job source always means "write" — there is nothing to
+    # search for. Otherwise RUN_MODE decides, defaulting to both stages.
+    mode = "write" if job_source else (RUN_MODE if RUN_MODE in ("search", "both") else "both")
+    writing = mode in ("write", "both")
+    searching = mode in ("search", "both")
+    want = JOB_MATCH_COUNT if searching else 1
+    job_supplied = mode == "write"
+
+    total_stages = 1 + (1 if searching else 1) + (2 if writing else 1)
+    stage = 0
+
+    def step(message, *args):
+        nonlocal stage
+        stage += 1
+        log.info(f"[{stage}/{total_stages}] " + message, *args)
+
+    log.info(
+        "Mode: %s%s",
+        {"search": "search only (no resume written)",
+         "write": "write only (job supplied)",
+         "both": "search and write"}[mode],
+        f" — looking for up to {want} job(s)" if searching else "",
+    )
 
     try:
-        _validate_inputs(resume_path, job_description_path)
+        _validate_inputs(resume_path, job_source)
 
-        log.info("[1/4] Gathering candidate context from resume + GitHub...")
+        step("Gathering candidate context from resume + GitHub...")
         # The job description is deliberately NOT passed here. It would be
         # folded into the candidate summary, which every downstream prompt
         # receives labelled "Candidate background" — a posting's
         # requirements travelling as facts about the candidate. It goes to
         # job["full_requirements"] instead (see agents/jd_agent.py).
         candidate_context = gather_candidate_context(resume_path)
-        style_template = load_style_template()
+        style_template = load_style_template() if writing else None
 
+        # --- Job stage -------------------------------------------------
         if job_supplied:
-            log.info("[2/4] Using the supplied job posting (no search)...")
+            step("Using the supplied job posting (no search)...")
             try:
-                job, job_review = run_supplied_job_stage(candidate_context, job_description_path)
+                job, job_review = run_supplied_job_stage(candidate_context, job_source)
             except JobUnavailableError as exc:
                 # Halt and report. There is no fallback candidate here, and
                 # the failure message carries the copy-paste workaround the
                 # reader needs, so it goes on the page verbatim.
-                log.info("\nStopping before the writing stage: %s", exc)
-                os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
-                fail_path = os.path.join(DATA_OUTPUT_DIR, f"job_unavailable_{run_ts}.html")
-                try:
-                    page = render_job_unavailable_html(
-                        reason=str(exc),
-                        job_source=job_description_path,
-                        run_timestamp=run_ts,
-                    )
-                    with open(fail_path, "w", encoding="utf-8") as f:
-                        f.write(page)
-                    log.info("  Report: %s", fail_path)
-                except (RuntimeError, OSError) as render_exc:
-                    log.error("main: could not write the job-unavailable report: %s", render_exc, exc_info=True)
-                    log.info("  Warning: the report could not be written (%s).", render_exc)
+                log.info("\nStopping: %s", exc)
+                _write_report(
+                    os.path.join(DATA_OUTPUT_DIR, f"job_unavailable_{run_ts}.html"),
+                    render_job_unavailable_html(
+                        reason=str(exc), job_source=job_source, run_timestamp=run_ts
+                    ),
+                    "Report",
+                )
                 log.info("See the full run log for details: %s", log_file_path)
-                # Unlike an empty search, this is a failure the user must
-                # act on, so it exits non-zero.
                 sys.exit(1)
+            selections = [{"job": job, "review": job_review, "approved": None}]
             job_history = [{"cycle": 1, "job": job, "review": job_review}]
+            pool_size = 0
         else:
-            log.info(
-                "[2/4] Running search <-> judge loop (max %d cycles) to lock in a job...",
-                MAX_JOB_SEARCH_CYCLES,
+            step(
+                "Searching for up to %d matching job(s) (max %d judge cycles each)...",
+                want, MAX_JOB_SEARCH_CYCLES,
             )
-            job, job_review, job_history, pool_size = run_job_search_loop(
-                candidate_context, target_role, run_ts
+            selections, job_history, pool_size = find_matching_jobs(
+                candidate_context, target_role, run_ts, want=want
             )
-            log.info(
-                "  -> Final pick: %s at %s (%s)",
-                job.get("job_title"), job.get("company"), job.get("location"),
-            )
-            log.info("     %s", job.get("url"))
 
-            viable, reason = _job_viability(job, job_review, pool_size)
-            if not viable:
-                log.info("\nStopping before the writing stage: %s", reason)
-                os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
-                no_job_path = os.path.join(DATA_OUTPUT_DIR, f"no_job_found_{run_ts}.html")
-                try:
-                    page = render_no_job_html(
-                        reason=reason,
-                        job_history=job_history,
-                        target_role=target_role,
-                        pool_size=pool_size,
-                        max_job_cycles=MAX_JOB_SEARCH_CYCLES,
-                        min_viable_score=MIN_VIABLE_JOB_SCORE,
-                        run_timestamp=run_ts,
-                    )
-                    with open(no_job_path, "w", encoding="utf-8") as f:
-                        f.write(page)
-                    log.info("  Report: %s", no_job_path)
-                except (RuntimeError, OSError) as exc:
-                    log.error("main: could not write the no-job report: %s", exc, exc_info=True)
-                    log.info("  Warning: the no-job report could not be written (%s).", exc)
-                log.info("  Nothing was written to the resume history, so these postings "
-                         "remain available to a future run.")
+            if not selections:
+                reason = _no_jobs_reason(pool_size)
+                log.info("\nStopping: %s", reason)
+                _write_report(
+                    os.path.join(DATA_OUTPUT_DIR, f"no_job_found_{run_ts}.html"),
+                    render_no_job_html(
+                        reason=reason, job_history=job_history, target_role=target_role,
+                        pool_size=pool_size, max_job_cycles=MAX_JOB_SEARCH_CYCLES,
+                        min_viable_score=MIN_VIABLE_JOB_SCORE, run_timestamp=run_ts,
+                    ),
+                    "Report",
+                )
+                log.info(
+                    "  Nothing was written to the job history, so these postings "
+                    "remain available to a future run."
+                )
                 log.info("See the full run log for details: %s", log_file_path)
-                # Not an error: a week with no good match is a legitimate outcome,
-                # so scheduled runs shouldn't alarm on it.
+                # Not an error: a fortnight with no good match is a legitimate
+                # outcome, so scheduled runs shouldn't alarm on it.
                 return
 
-        # Recorded as soon as the job is locked in, not at the end of the
-        # run: if the writer or judge stage crashes, this posting has still
-        # been consumed, and a re-run that landed on it again would repeat
-        # the same failure rather than trying something new.
-        record_selection(job, run_timestamp=run_ts, review=job_review)
-
-        log.info(
-            "[3/4] Running writer <-> judge loop (max %d cycles) to tailor the resume...",
-            MAX_RESUME_REVISE_CYCLES,
-        )
-        final_draft, resume_review, resume_history = run_resume_revise_loop(
-            candidate_context, job, style_template=style_template, job_review=job_review
-        )
-
-        log.info("[4/4] Rendering output...")
-        os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
-
-        md_path = os.path.join(DATA_OUTPUT_DIR, f"tailored_resume_{run_ts}.md")
-        try:
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(final_draft)
-        except OSError as exc:
-            log.error("main: failed writing resume Markdown to %s: %s", md_path, exc, exc_info=True)
-            raise RuntimeError(f"Could not write resume Markdown to '{md_path}' — {exc}") from exc
-
-        review_path = os.path.join(DATA_OUTPUT_DIR, f"resume_review_{run_ts}.json")
-        try:
-            with open(review_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "job": job,
-                        "job_search_stage": {
-                            "final_review": job_review,
-                            "cycle_history": job_history,
-                        },
-                        "resume_revise_stage": {
-                            "final_review": resume_review,
-                            "cycle_history": resume_history,
-                        },
-                    },
-                    f,
-                    indent=2,
+            log.info("  Selected %d job(s):", len(selections))
+            for index, selection in enumerate(selections, 1):
+                picked = selection["job"]
+                log.info(
+                    "    %d. %s at %s — %s/10%s",
+                    index, picked.get("job_title"), picked.get("company"),
+                    selection["review"].get("job_match_score"),
+                    " (approved)" if selection["approved"] else " (viable, not approved)",
                 )
-        except (OSError, TypeError) as exc:
-            # TypeError: something non-JSON-serializable ended up in one of
-            # the dicts (shouldn't happen, but don't let it take down a run
-            # that otherwise succeeded).
-            log.error("main: failed writing review JSON to %s: %s", review_path, exc, exc_info=True)
+                log.info("       %s", picked.get("url"))
+
+        # --- Search-only: report and stop ------------------------------
+        if not writing:
+            step("Writing the job report (resume writing is off)...")
+            _write_report(
+                os.path.join(DATA_OUTPUT_DIR, f"jobs_found_{run_ts}.html"),
+                render_jobs_found_html(
+                    selections=selections, target_role=target_role,
+                    pool_size=pool_size, run_timestamp=run_ts,
+                ),
+                "Job report",
+            )
+            # Deliberately NOT recorded in selected_jobs.json. Nothing was
+            # applied for, so these postings must stay available to a later
+            # run that does write resumes for them.
             log.info(
-                "  Warning: could not save resume_review.json (%s). "
-                "Continuing to render the resume and review HTML.",
-                exc,
+                "\nDone. %d job(s) found. Nothing was written to the job history, "
+                "so a later run can still pick these up.",
+                len(selections),
+            )
+            return
+
+        # --- Writing stage, once per selected job ----------------------
+        step(
+            "Writing and reviewing %d resume(s) (max %d cycles each)...",
+            len(selections), MAX_RESUME_REVISE_CYCLES,
+        )
+        results = []
+        for index, selection in enumerate(selections, 1):
+            job, job_review = selection["job"], selection["review"]
+            if len(selections) > 1:
+                log.info(
+                    "  --- Job %d of %d: %s at %s ---",
+                    index, len(selections), job.get("job_title"), job.get("company"),
+                )
+
+            # Recorded as writing starts for this job, not at the end: if a
+            # later stage crashes, the posting has still been consumed, and
+            # a re-run landing on it again would repeat the same failure
+            # rather than trying something new.
+            record_selection(job, run_timestamp=run_ts, review=job_review)
+
+            final_draft, resume_review, resume_history = run_resume_revise_loop(
+                candidate_context, job, style_template=style_template, job_review=job_review
+            )
+            results.append((job, job_review, resume_review, resume_history, final_draft))
+
+        # --- Suggestion gate, or render --------------------------------
+        # With the gate on, the run STOPS here rather than rendering. The
+        # judge's remaining suggestions are offered for selection and
+        # applied by finalize.py, which then renders. Rendering first and
+        # reporting suggestions afterwards produced advice about a PDF that
+        # was already written — see config.SUGGESTION_GATE.
+        if SUGGESTION_GATE:
+            step("Pausing for your decisions on the judge's suggestions...")
+            paused = 0
+            for index, (job, job_review, resume_review, resume_history, final_draft) in enumerate(results, 1):
+                suffix = run_ts if len(results) == 1 else f"{run_ts}_{index}"
+                suggestions = resume_review.get("suggestions")
+                suggestions = [s for s in suggestions if str(s).strip()] if isinstance(suggestions, list) else []
+
+                if not suggestions:
+                    # Nothing to decide, so nothing to wait for. Pausing
+                    # here would make the user click through an empty list
+                    # to get the PDF the pipeline could already have given
+                    # them.
+                    log.info(
+                        "  %s at %s — the judge left no suggestions; rendering directly.",
+                        job.get("job_title"), job.get("company"),
+                    )
+                    render_outputs(
+                        final_draft, job, job_review, resume_review,
+                        job_history, resume_history, suffix, job_supplied,
+                    )
+                    continue
+
+                write_pending(
+                    suffix,
+                    {
+                        "suffix": suffix,
+                        "job": job,
+                        "job_review": job_review,
+                        "resume_review": resume_review,
+                        "job_history": job_history,
+                        "resume_history": resume_history,
+                        "draft": final_draft,
+                        "candidate_context": candidate_context,
+                        "style_template": style_template,
+                        "job_supplied": job_supplied,
+                        "suggestions": suggestions,
+                    },
+                )
+                paused += 1
+                log.info(
+                    "  %s at %s — %d suggestion(s) waiting for your selection (id: %s)",
+                    job.get("job_title"), job.get("company"), len(suggestions), suffix,
+                )
+                for number, suggestion in enumerate(suggestions, 1):
+                    log.info("      %d. %s", number, suggestion)
+
+            if paused:
+                log.info(
+                    "\nPaused. Pick the suggestions you want in the web UI, or run:\n"
+                    "  python finalize.py <id> <numbers>   e.g. python finalize.py %s 1,3\n"
+                    "  python finalize.py <id> none        to render the draft as-is\n"
+                    "The PDF is written once you choose.",
+                    run_ts,
+                )
+            log_cache_summary(log)
+            return
+
+        step("Rendering output...")
+        for index, (job, job_review, resume_review, resume_history, final_draft) in enumerate(results, 1):
+            suffix = run_ts if len(results) == 1 else f"{run_ts}_{index}"
+            if len(results) > 1:
+                log.info("  Job %d — %s at %s:", index, job.get("job_title"), job.get("company"))
+            render_outputs(
+                final_draft, job, job_review, resume_review,
+                job_history, resume_history, suffix, job_supplied,
             )
 
-        title = f"{job.get('job_title', 'Tailored Resume')} — {job.get('company', '')}".strip(" —")
-
-        pdf_path = os.path.join(DATA_OUTPUT_DIR, f"tailored_resume_{run_ts}.pdf")
-        pdf_ok = True
-        try:
-            render_resume_pdf(final_draft, pdf_path, title=title)
-        except RuntimeError as exc:
-            # PDF rendering is the one step most likely to fail purely on
-            # environment grounds (missing system libraries) rather than a
-            # real bug — don't let it take down a run that already produced
-            # a valid Markdown resume and both judge verdicts.
-            log.error("main: PDF rendering failed: %s", exc, exc_info=True)
-            log.info("  Warning: PDF rendering failed (%s). Markdown resume was still saved.", exc)
-            pdf_ok = False
-
-        review_html_path = os.path.join(DATA_OUTPUT_DIR, f"resume_review_{run_ts}.html")
-        html_ok = True
-        try:
-            review_html = render_review_html(
-                job_review,
-                resume_review,
-                job,
-                job_cycle_number=len(job_history),
-                max_job_cycles=MAX_JOB_SEARCH_CYCLES,
-                resume_cycle_number=len(resume_history),
-                max_resume_cycles=MAX_RESUME_REVISE_CYCLES,
-                job_supplied=job_supplied,
-                # The writer's gap flags. They belong here, not in the resume
-                # PDF an employer receives — see pdf_renderer.py.
-                writer_notes=extract_notes(final_draft),
-                title=f"Review — {title}" if title else "Resume & Job Review",
+        log.info("\nDone. %d resume(s) written.", len(results))
+        for job, job_review, resume_review, _, _ in results:
+            log.info(
+                "  %s at %s — job match %s/10, resume fitness %s/10",
+                job.get("job_title"), job.get("company"),
+                job_review.get("job_match_score"), resume_review.get("fitness_score"),
             )
-            with open(review_html_path, "w", encoding="utf-8") as f:
-                f.write(review_html)
-        except (RuntimeError, OSError) as exc:
-            log.error("main: review HTML rendering/write failed: %s", exc, exc_info=True)
-            log.info("  Warning: review HTML could not be generated (%s).", exc)
-            html_ok = False
-
-        log.info(
-            "\nDone. Job search: %d cycle(s). Resume revise: %d cycle(s).",
-            len(job_history), len(resume_history),
-        )
-        log.info("  Markdown:    %s", md_path)
-        log.info("  PDF:         %s", pdf_path if pdf_ok else "(failed — see warning above)")
-        log.info("  Review HTML: %s", review_html_path if html_ok else "(failed — see warning above)")
-        log.info("  Review JSON: %s", review_path)
-        log.info(
-            "\nJob match score:    %s/10 — %s",
-            job_review.get("job_match_score"), job_review.get("job_match_summary", ""),
-        )
-        log.info(
-            "Resume fitness score: %s/10 — %s",
-            resume_review.get("fitness_score"), resume_review.get("fitness_summary", ""),
-        )
+        log_cache_summary(log)
 
     except FileNotFoundError as exc:
         log.error("main: input file missing: %s", exc, exc_info=True)

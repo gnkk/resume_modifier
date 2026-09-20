@@ -14,6 +14,16 @@ data/output/*
 !data/input/.gitkeep
 !data/output/.gitkeep
 
+# Run logs, intermediates, and the paused-run state for the suggestion gate.
+# Ignored wholesale rather than by extension: data/work/ holds drafts of your
+# actual resume and scraped postings, and data/logs/ records every run.
+data/logs/
+data/work/
+
+# Cross-run ledger of jobs you've targeted. Local by definition — it is a
+# record of where you applied.
+data/selected_jobs.json
+
 # OS/editor cruft
 .DS_Store
 .vscode/

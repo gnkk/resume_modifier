@@ -39,11 +39,43 @@ import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL_JUDGE, JUDGE_APPROVAL_SCORE, RESUME_APPROVAL_SCORE, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES
 from agents.market_context import MARKET_CALIBRATION
-from logger_setup import get_logger, note_model
+from logger_setup import get_logger, note_model, note_cache
 
 log = get_logger(__name__)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# --- Prompt caching ----------------------------------------------------
+# Both judges are called repeatedly within one job, minutes apart, over a
+# prompt that is mostly identical every time: a long system prompt, the
+# candidate's context, and (for the resume judge) the template and the
+# job's requirements. Cache reads bill at a tenth of base input, so the
+# repeats cost close to nothing, and the thinking budget means these are
+# the slowest calls in the pipeline — the latency saving lands here more
+# than anywhere else.
+#
+# What varies goes LAST, after the final breakpoint: the posting under
+# review for review_job, the draft under review for review_resume. A
+# breakpoint on either would write an entry per call and read none.
+#
+# The thinking configuration and effort are rendered into the prompt, so
+# they must stay identical across cycles or the message cache is
+# invalidated. Both are fixed constants here for that reason.
+_CACHE_CONTROL = {"type": "ephemeral"}
+JUDGE_THINKING = {"type": "adaptive"}
+JUDGE_EFFORT = {"effort": "high"}
+
+
+def _cached(text: str) -> dict:
+    return {"type": "text", "text": text, "cache_control": _CACHE_CONTROL}
+
+
+def _blocks(stable: str, varying: str) -> list[dict]:
+    """A cacheable prefix followed by the per-call material."""
+    blocks = [_cached(stable)]
+    if varying.strip():
+        blocks.append({"type": "text", "text": varying})
+    return blocks
 
 # Matches a fenced code block, optionally tagged ```json ... ``` — models
 # occasionally wrap JSON in one of these despite being told not to.
@@ -253,16 +285,22 @@ def review_job(job: dict, candidate_context: str) -> dict:
             # nothing for the answer and producing an empty response that looks
             # like a parse failure. Leave plenty of headroom.
             max_tokens=8192,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
-            system=JOB_SYSTEM_PROMPT,
+            thinking=JUDGE_THINKING,
+            output_config=JUDGE_EFFORT,
+            system=[_cached(JOB_SYSTEM_PROMPT)],
             messages=[
                 {
                     "role": "user",
-                    "content": (
-                        f"Candidate background:\n{candidate_context}\n\n"
-                        f"{job_block}\n"
-                        "Evaluate whether this was the right job to target now."
+                    # The candidate never changes across this stage's cycles;
+                    # the posting is what the loop is walking through. So the
+                    # breakpoint sits between them, and cycles 2 and 3 read
+                    # the context back instead of re-paying for it.
+                    "content": _blocks(
+                        stable=f"Candidate background:\n{candidate_context}",
+                        varying=(
+                            f"\n\n{job_block}\n"
+                            "Evaluate whether this was the right job to target now."
+                        ),
                     ),
                 }
             ],
@@ -275,6 +313,7 @@ def review_job(job: dict, candidate_context: str) -> dict:
         ) from exc
 
     note_model(log, "job judge", response)
+    note_cache("job judge", response)
     raw_text = _extract_text(response, "judge.review_job")
 
     result = _parse_review_json(raw_text)
@@ -503,19 +542,26 @@ def review_resume(
             # max_tokens. This call carries an entire resume draft on top of
             # the context and job, so it needs even more headroom.
             max_tokens=12000,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
-            system=RESUME_SYSTEM_PROMPT,
+            thinking=JUDGE_THINKING,
+            output_config=JUDGE_EFFORT,
+            system=[_cached(RESUME_SYSTEM_PROMPT)],
             messages=[
                 {
                     "role": "user",
-                    "content": (
-                        f"{template_block}"
-                        f"{_known_limitations_block(job_review)}"
-                        f"Candidate background:\n{candidate_context}\n\n"
-                        f"{job_block}\n"
-                        f"Drafted resume to review:\n{resume_draft}\n\n"
-                        "Evaluate this resume now."
+                    # Template, settled items, candidate and job are fixed
+                    # for the whole writer/judge loop; only the draft
+                    # changes per cycle, so it goes after the breakpoint.
+                    "content": _blocks(
+                        stable=(
+                            f"{template_block}"
+                            f"{_known_limitations_block(job_review)}"
+                            f"Candidate background:\n{candidate_context}\n\n"
+                            f"{job_block}"
+                        ),
+                        varying=(
+                            f"\nDrafted resume to review:\n{resume_draft}\n\n"
+                            "Evaluate this resume now."
+                        ),
                     ),
                 }
             ],
@@ -528,6 +574,7 @@ def review_resume(
         ) from exc
 
     note_model(log, "resume judge", response)
+    note_cache("resume judge", response)
     raw_text = _extract_text(response, "judge.review_resume")
 
     result = _parse_review_json(raw_text)

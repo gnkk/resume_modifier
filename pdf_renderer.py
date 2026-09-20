@@ -279,6 +279,43 @@ def _tag_kv_paragraphs(html: str) -> str:
     return re.sub(r"<p>(<strong>[^<]*:</strong>)", r'<p class="kv">\1', html)
 
 
+def _promote_name_heading(header_md: str) -> str:
+    """
+    Ensure the header block opens with an `#` heading for the name.
+
+    The writer is told to emit one, but it takes its layout cues from the
+    template resume, whose text was extracted from a PDF and therefore
+    carries no Markdown at all — the name there is just the first line.
+    Copying that faithfully produces a header with no heading, and since
+    everything in the header that isn't a heading is styled as contact
+    detail, the candidate's name then renders at 9pt in grey, the same as
+    their phone number. That is the single most visible way this pipeline
+    can produce a bad-looking resume, so it is corrected here rather than
+    left to the prompt: a formatting slip the renderer can unambiguously
+    detect should not depend on a model remembering a rule.
+
+    Only the first non-empty line is touched, and only when it is not
+    already a heading.
+    """
+    lines = header_md.splitlines()
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if line.lstrip().startswith("#"):
+            return header_md
+        # A fully-bold first line is the same intent expressed differently.
+        bold = _BOLD_LINE_RE.match(line.strip())
+        name = bold.group(1).strip() if bold else line.strip()
+        log.info(
+            "  Note: the resume header had no '# Name' heading — promoting "
+            "the first line ('%s') so the name renders as the title.",
+            name[:60],
+        )
+        lines[i] = f"# {name}"
+        return "\n".join(lines)
+    return header_md
+
+
 def _render_header_html(header_md: str) -> str:
     """
     Render the name/tagline/contact block.
@@ -292,7 +329,7 @@ def _render_header_html(header_md: str) -> str:
     if not header_md.strip():
         return ""
 
-    html = md_lib.markdown(header_md, extensions=["extra", "nl2br"])
+    html = md_lib.markdown(_promote_name_heading(header_md), extensions=["extra", "nl2br"])
 
     def classify(match: re.Match) -> str:
         inner = match.group(1).strip()

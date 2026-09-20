@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 
 from jobspy import scrape_jobs
 
-from config import JOB_SEARCH_SITES, JOB_SEARCH_HOURS_OLD, JOBSPY_COUNTRY_INDEED
+from config import JOB_SEARCH_SITES, JOB_SEARCH_DAYS_OLD, JOBSPY_COUNTRY_INDEED
 from logger_setup import get_logger
 
 log = get_logger(__name__)
@@ -346,7 +346,7 @@ def search(
     location: str | None = None,
     site_name: list[str] | None = None,
     is_remote: bool = False,
-    hours_old: int | None = None,
+    days_old: int | None = None,
     results_wanted: int = 15,
     job_type: str | None = None,
     distance: int = 50,
@@ -374,8 +374,12 @@ def search(
     loop; the agent sees it as normal tool output and can react (e.g.
     retry narrower, or fall back to Firecrawl for that angle).
 
-    Args mirror python-jobspy's scrape_jobs() directly; see
-    JOBSPY_SEARCH_TOOL_SCHEMA below for the subset exposed to the
+    Args mirror python-jobspy's scrape_jobs() directly, with one
+    deliberate exception: posting age is taken in DAYS here and converted
+    to the hours JobSpy wants at the call below. Days is the unit the rest
+    of this project configures and talks in, and keeping the conversion in
+    one place means no caller has to remember which unit it is holding.
+    See JOBSPY_SEARCH_TOOL_SCHEMA below for the subset exposed to the
     search agent as a tool call.
     """
     requested = site_name or JOB_SEARCH_SITES
@@ -401,6 +405,8 @@ def search(
             }
         ]
 
+    window_days = days_old if days_old is not None else JOB_SEARCH_DAYS_OLD
+
     try:
         df = scrape_jobs(
             site_name=sites,
@@ -410,7 +416,7 @@ def search(
             job_type=job_type,
             is_remote=is_remote,
             results_wanted=results_wanted,
-            hours_old=hours_old if hours_old is not None else JOB_SEARCH_HOURS_OLD,
+            hours_old=window_days * 24,
             country_indeed=country_indeed or JOBSPY_COUNTRY_INDEED,
             description_format="markdown",
             linkedin_fetch_description=linkedin_fetch_description,
@@ -456,9 +462,9 @@ def search(
     if not records:
         log.info(
             "jobspy search: 0 results for search_term=%r location=%r sites=%r "
-            "(hours_old=%s) — try a different search_term/location/site_name "
+            "(days_old=%s) — try a different search_term/location/site_name "
             "before falling back to Firecrawl.",
-            search_term, location, sites, hours_old or JOB_SEARCH_HOURS_OLD,
+            search_term, location, sites, window_days,
         )
         note = (
             f"No results from {', '.join(sites)} for this query."
@@ -537,12 +543,12 @@ JOBSPY_SEARCH_TOOL_SCHEMA = {
                 "type": "boolean",
                 "description": "True to filter for remote-only postings.",
             },
-            "hours_old": {
+            "days_old": {
                 "type": "integer",
                 "description": (
-                    f"Max posting age in hours. Defaults to {JOB_SEARCH_HOURS_OLD} (past "
-                    "week) if omitted. LinkedIn/Indeed respect this precisely; other "
-                    "sites round up to whole days."
+                    f"Max posting age in DAYS. Defaults to {JOB_SEARCH_DAYS_OLD} if "
+                    "omitted. LinkedIn/Indeed honour this to the hour internally; "
+                    "other sites round to whole days."
                 ),
             },
             "results_wanted": {

@@ -20,11 +20,26 @@ within-run loop already excludes them for the run that's in progress.
 Never load-bearing. A missing, unreadable, or corrupt ledger degrades to
 "no history" and the run proceeds normally — losing deduplication is a
 far smaller failure than refusing to search.
+
+DELIBERATELY NOT TIED TO data/output/. Deleting a job's output folder
+does not make that posting available again, and should not: the folder
+holds a rendered PDF, while this ledger records that the posting was
+targeted. Wanting to delete the one is usually about tidying disk; wanting
+to undo the other is a decision, and it gets its own explicit command
+rather than being a side effect of a file deletion.
+
+Editing it: this module is runnable.
+    python job_history.py --list
+    python job_history.py --forget 2,5      by number, as --list shows them
+    python job_history.py --forget acme     by company, title or URL text
+    python job_history.py --clear
+The web UI exposes the same thing as checkboxes.
 """
 
 import json
 import os
 import re
+import sys
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from config import SELECTED_JOBS_HISTORY_PATH
@@ -216,3 +231,150 @@ def record_selection(
 
     log.info("  Recorded this run's pick in %s (%d job(s) on file).", path, len(history))
     return True
+
+
+# ---------------------------------------------------------------------
+# Editing the ledger
+# ---------------------------------------------------------------------
+
+def _write_history(history: list[dict], path: str) -> bool:
+    """Persist the ledger. Returns False on failure rather than raising."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(history, handle, indent=2, default=str)
+        return True
+    except (OSError, TypeError) as exc:
+        log.error("job_history: could not write %s: %s", path, exc, exc_info=True)
+        return False
+
+
+def list_selections(path: str = SELECTED_JOBS_HISTORY_PATH) -> list[dict]:
+    """
+    The ledger with a 1-based `n` on each row, newest last.
+
+    The number is what every editing command takes, so what you read and
+    what you type are the same thing.
+    """
+    return [{"n": i, **entry} for i, entry in enumerate(load_history(path), 1)]
+
+
+def forget_selections(
+    keys: list,
+    path: str = SELECTED_JOBS_HISTORY_PATH,
+) -> list[dict]:
+    """
+    Remove entries so those postings can be selected again.
+
+    `keys` accepts row numbers as shown by list_selections(), or free text
+    matched case-insensitively against a row's company, title or URL. Text
+    matching is there because the reason you want a job back is usually
+    "redo the Acme one", not "redo row 7".
+
+    Returns the removed entries. Removing nothing is not an error — it
+    means nothing matched, which the caller reports.
+
+    Note what this does NOT do: it does not delete the resume that was
+    produced for that posting. The output folder is yours to keep or bin
+    independently; this only controls whether the job can be picked again.
+    """
+    history = load_history(path)
+    if not history or not keys:
+        return []
+
+    doomed: set[int] = set()
+    for key in keys:
+        text = str(key).strip()
+        if not text:
+            continue
+        if text.isdigit():
+            index = int(text) - 1
+            if 0 <= index < len(history):
+                doomed.add(index)
+            continue
+        needle = text.lower()
+        for index, entry in enumerate(history):
+            haystack = " ".join(
+                str(entry.get(field) or "")
+                for field in ("company", "job_title", "url")
+            ).lower()
+            if needle in haystack:
+                doomed.add(index)
+
+    if not doomed:
+        return []
+
+    removed = [history[i] for i in sorted(doomed)]
+    remaining = [entry for i, entry in enumerate(history) if i not in doomed]
+
+    if not _write_history(remaining, path):
+        log.info("  Warning: the history could not be saved, so nothing was removed.")
+        return []
+
+    for entry in removed:
+        log.info(
+            "  Removed from history: %s at %s — it can be selected again.",
+            entry.get("job_title"), entry.get("company"),
+        )
+    return removed
+
+
+def clear_history(path: str = SELECTED_JOBS_HISTORY_PATH) -> int:
+    """Empty the ledger. Returns how many entries were dropped."""
+    count = len(load_history(path))
+    if count and _write_history([], path):
+        log.info("  Cleared %d entry(ies) from the job history.", count)
+        return count
+    return 0
+
+
+def _print_history(path: str) -> None:
+    entries = list_selections(path)
+    if not entries:
+        print("No jobs on file — nothing is being filtered out.")
+        return
+    print(f"{len(entries)} job(s) on file (these are skipped in future runs):\n")
+    for entry in entries:
+        print(
+            f"  {entry['n']:>3}. {entry.get('job_title')} at {entry.get('company')}"
+            f"  [{entry.get('run') or 'no run id'}]"
+        )
+        print(f"       {entry.get('url')}")
+    print("\nRedo one: python job_history.py --forget <number(s) or text>")
+
+
+def main() -> None:
+    path = SELECTED_JOBS_HISTORY_PATH
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("--list", "-l"):
+        _print_history(path)
+        return
+
+    if args[0] == "--clear":
+        count = clear_history(path)
+        print(f"Cleared {count} entry(ies)." if count else "Nothing to clear.")
+        return
+
+    if args[0] == "--forget" and len(args) > 1:
+        keys = [k for k in ",".join(args[1:]).split(",") if k.strip()]
+        removed = forget_selections(keys, path)
+        if not removed:
+            print("Nothing matched — run --list to see what's on file.")
+            return
+        print(f"Removed {len(removed)} entry(ies); those jobs can be selected again:")
+        for entry in removed:
+            print(f"  - {entry.get('job_title')} at {entry.get('company')}")
+        return
+
+    print(
+        "Usage:\n"
+        "  python job_history.py --list\n"
+        "  python job_history.py --forget 2,5\n"
+        "  python job_history.py --forget acme\n"
+        "  python job_history.py --clear"
+    )
+
+
+if __name__ == "__main__":
+    main()

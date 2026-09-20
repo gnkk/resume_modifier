@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Resume Agent</title>
+<style>
+  :root {
+    --text: #1a1a1a; --muted: #5a5a5a; --accent: #1f4e79;
+    --border: #dcdcdc; --bg: #f4f5f7; --panel: #fff;
+    --good: #1e7b34; --bad: #b3261e; --warn: #9a6700;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Helvetica Neue", Arial, sans-serif; line-height: 1.5;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 24px 60px; }
+  h1 { font-size: 1.5em; margin: 0 0 2px; color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 22px; font-size: 0.92em; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px; margin-bottom: 18px;
+  }
+  .panel h2 {
+    font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.09em;
+    color: var(--accent); margin: 0 0 14px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  label { display: block; font-size: 0.82em; font-weight: 600; margin: 12px 0 4px; }
+  label:first-of-type { margin-top: 0; }
+  .hint { font-weight: 400; color: var(--muted); font-size: 0.92em; }
+  input[type=text], input[type=number], select {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--border);
+    border-radius: 6px; font: inherit; font-size: 0.92em; background: #fff;
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+  input:focus, select:focus {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(31,78,121,.12);
+  }
+  .modes { display: flex; gap: 8px; margin-bottom: 4px; }
+  .modes button {
+    flex: 1; padding: 10px; border: 1px solid var(--border); background: #fff;
+    border-radius: 8px; cursor: pointer; font: inherit; font-size: 0.9em; text-align: left;
+    transition: border-color .18s ease, background .18s ease, transform .12s ease;
+  }
+  .modes button:hover { transform: translateY(-1px); }
+  .modes button.on { border-color: var(--accent); background: #eef4fa; }
+  .modes button strong { display: block; font-size: 1em; }
+  .modes button span { color: var(--muted); font-size: 0.85em; }
+  .counts { display: flex; gap: 6px; }
+  .counts .count {
+    flex: 1; padding: 7px 0; border: 1px solid var(--border); background: #fff;
+    border-radius: 6px; cursor: pointer; font: inherit; font-weight: 600;
+    transition: border-color .18s ease, background .18s ease, color .18s ease;
+  }
+  .counts .count.on { border-color: var(--accent); background: var(--accent); color: #fff; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 0.85em; }
+  .check input { width: auto; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; font-size: 0.85em; font-weight: 600; color: var(--accent); }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 18px; }
+  button.primary {
+    background: var(--accent); color: #fff; border: 0; padding: 10px 20px;
+    border-radius: 7px; font: inherit; font-weight: 600; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px; transition: background .18s ease;
+  }
+  button.primary:disabled { background: #9bb2c6; cursor: not-allowed; }
+  button.ghost {
+    background: #fff; border: 1px solid var(--border); padding: 10px 16px;
+    border-radius: 7px; font: inherit; cursor: pointer;
+  }
+  .err { color: var(--bad); font-size: 0.85em; margin-top: 10px; }
+  .note { color: var(--muted); font-size: 0.8em; margin-top: 10px; }
+
+  /* ---------- Suggestion gate ---------- */
+  .gate-job { font-size: 0.9em; font-weight: 600; margin-bottom: 2px; }
+  .gate-meta { color: var(--muted); font-size: 0.82em; margin-bottom: 10px; }
+  .sugg {
+    display: flex; gap: 9px; align-items: flex-start; padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: 7px; margin-bottom: 7px;
+    font-size: 0.87em; cursor: pointer; background: #fff;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .sugg:hover { border-color: var(--accent); }
+  .sugg input { margin-top: 3px; flex: none; }
+  .sugg.on { border-color: var(--accent); background: #eef4fa; }
+  .gate-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+  .gate-actions .spacer { flex: 1; }
+  .linkish {
+    background: none; border: 0; color: var(--accent); font: inherit;
+    font-size: 0.82em; cursor: pointer; padding: 0; text-decoration: underline;
+  }
+  .gate + .panel { margin-top: 0; }
+
+  /* ---------- Run feedback ---------- */
+  .statusbar { display: flex; align-items: center; gap: 9px; font-size: 0.85em; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #b9c0c7; flex: none; }
+  .dot.running { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+  .dot.finished { background: var(--good); }
+  .dot.failed { background: var(--bad); }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(31,78,121,.45); }
+    50% { box-shadow: 0 0 0 6px rgba(31,78,121,0); }
+  }
+
+  .spinner {
+    width: 13px; height: 13px; border-radius: 50%; flex: none;
+    border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+    animation: spin .7s linear infinite; display: none;
+  }
+  button.primary.busy .spinner { display: block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Stage tracker */
+  .stages { list-style: none; margin: 0; padding: 0; }
+  .stage {
+    display: flex; gap: 11px; align-items: flex-start; padding: 7px 0;
+    opacity: .45; transition: opacity .3s ease;
+  }
+  .stage.active, .stage.done { opacity: 1; }
+  .stage .marker {
+    width: 20px; height: 20px; border-radius: 50%; flex: none; margin-top: 1px;
+    border: 2px solid var(--border); background: #fff; position: relative;
+    transition: border-color .3s ease, background .3s ease;
+  }
+  .stage.active .marker { border-color: var(--accent); animation: ring 1.6s ease-in-out infinite; }
+  .stage.done .marker { border-color: var(--good); background: var(--good); }
+  .stage.done .marker::after {
+    content: ""; position: absolute; left: 5px; top: 1px; width: 5px; height: 10px;
+    border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg);
+    animation: pop .25s ease-out;
+  }
+  @keyframes ring {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(31,78,121,.35); }
+    50% { box-shadow: 0 0 0 5px rgba(31,78,121,0); }
+  }
+  @keyframes pop { from { transform: rotate(45deg) scale(.4); opacity: 0; } }
+  .stage .label { font-size: 0.86em; font-weight: 600; }
+  .stage .detail { font-size: 0.8em; color: var(--muted); min-height: 1.2em; }
+
+  /* Indeterminate progress bar */
+  .bar { height: 3px; background: #e5e8eb; border-radius: 2px; overflow: hidden; margin: 4px 0 14px; }
+  .bar span { display: block; height: 100%; width: 35%; background: var(--accent); border-radius: 2px;
+    transform: translateX(-100%); }
+  .bar.on span { animation: slide 1.5s ease-in-out infinite; }
+  @keyframes slide {
+    0% { transform: translateX(-100%); } 100% { transform: translateX(340%); }
+  }
+
+  /* Live stats */
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+  .chip {
+    font-size: 0.75em; padding: 3px 9px; border-radius: 20px;
+    background: #eef1f4; color: var(--muted); border: 1px solid var(--border);
+    animation: rise .3s ease-out;
+  }
+  .chip b { color: var(--text); }
+  .chip.good { background: #e8f5ec; border-color: #bfe0c9; }
+  .chip.warn { background: #fdf5e3; border-color: #ecd9a8; }
+  @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+
+  #log {
+    background: #101418; color: #d6dde3; border-radius: 8px; padding: 12px 14px;
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.76em;
+    line-height: 1.45; height: 320px; overflow-y: auto; white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #log:empty::before { content: "No run yet."; color: #6b7883; }
+  #log .ln { animation: fade .25s ease-out; }
+  #log .warn { color: #ffcf70; }
+  #log .bad { color: #ff9a8f; }
+  #log .ok { color: #8fd8a5; }
+  @keyframes fade { from { opacity: 0; } }
+
+  #outputs a {
+    display: block; color: var(--accent); font-size: 0.85em; padding: 4px 0;
+    animation: rise .3s ease-out; text-decoration: none;
+  }
+  #outputs a:hover { text-decoration: underline; }
+  .fresh { font-size: 0.7em; color: var(--good); margin-left: 6px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Resume Agent</h1>
+  <p class="sub">Local control panel. Settings here override config.py for one run only — nothing on disk changes.</p>
+
+  <div class="grid">
+    <div>
+      <div class="panel">
+        <h2>What to run</h2>
+
+        <div class="modes">
+          <button type="button" id="mode-both" class="on" onclick="setMode('both')">
+            <strong>Search + write</strong>
+            <span>Find jobs, then tailor a resume for each</span>
+          </button>
+          <button type="button" id="mode-search" onclick="setMode('search')">
+            <strong>Search only</strong>
+            <span>Just show me the jobs</span>
+          </button>
+          <button type="button" id="mode-write" onclick="setMode('write')">
+            <strong>Write only</strong>
+            <span>I have the job posting</span>
+          </button>
+        </div>
+
+        <label>Resume PDF</label>
+        <select id="resume">
+          {% for f in resumes %}<option value="{{ f.path }}">{{ f.name }}</option>{% endfor %}
+        </select>
+        {% if not resumes %}<div class="note">No PDFs in data/input/ — add one there first.</div>{% endif %}
+
+        <div id="search-fields">
+          <label>Target role <span class="hint">— steers every search angle, so be specific</span></label>
+          <input type="text" id="target_role" placeholder="Machine Learning Engineer, NLP and LLMs, Canada">
+
+          <label>How many jobs to find</label>
+          <div class="counts">
+            <button type="button" class="count on" data-n="1" onclick="setCount(1)">1</button>
+            <button type="button" class="count" data-n="2" onclick="setCount(2)">2</button>
+            <button type="button" class="count" data-n="3" onclick="setCount(3)">3</button>
+          </div>
+          <div class="note" id="countNote">
+            The pool is ranked by fit, so each extra job is a weaker match than the
+            one before it — and with writing on, each gets its own resume and its own
+            judge cycles.
+          </div>
+        </div>
+
+          <div id="writer-fields" style="display:none">
+          <label>Job posting <span class="hint">— a saved file, or a URL below</span></label>
+          <select id="jd_file">
+            <option value="">— use the URL instead —</option>
+            {% for f in jd_files %}<option value="{{ f.path }}">{{ f.name }}</option>{% endfor %}
+          </select>
+          <label>Posting URL</label>
+          <input type="text" id="jd_url" placeholder="https://www.linkedin.com/jobs/view/…">
+          <div class="note">LinkedIn is fetched via JobSpy; other sites via Firecrawl. Glassdoor and
+            Facebook can't be fetched — save the text to a .txt in data/input/ instead.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Pool construction</h2>
+        <div class="row">
+          <div><label>Scrape ceiling</label><input type="number" id="JOB_SCRAPE_CEILING" value="{{ defaults.JOB_SCRAPE_CEILING }}"></div>
+          <div><label>Keep after BM25</label><input type="number" id="BM25_KEEP" value="{{ defaults.BM25_KEEP }}"></div>
+        </div>
+        <div class="row">
+          <div><label>Screener floor <span class="hint">(1-10)</span></label><input type="number" id="POOL_SCREEN_MIN_FIT" min="1" max="10" value="{{ defaults.POOL_SCREEN_MIN_FIT }}"></div>
+          <div><label>Screener batch size</label><input type="number" id="POOL_SCREEN_BATCH_SIZE" value="{{ defaults.POOL_SCREEN_BATCH_SIZE }}"></div>
+        </div>
+        <div class="row">
+          <div><label>Snippet chars</label><input type="number" id="POOL_SCREEN_SNIPPET_CHARS" value="{{ defaults.POOL_SCREEN_SNIPPET_CHARS }}"></div>
+          <div><label>Posting age <span class="hint">(days)</span></label><input type="number" id="JOB_SEARCH_DAYS_OLD" min="1" value="{{ defaults.JOB_SEARCH_DAYS_OLD }}"></div>
+        </div>
+        <div class="row">
+          <div><label>Boards <span class="hint">(comma-separated)</span></label><input type="text" id="JOB_SEARCH_SITES" value="{{ defaults.JOB_SEARCH_SITES }}"></div>
+          <div><label>Indeed country</label><input type="text" id="JOBSPY_COUNTRY_INDEED" value="{{ defaults.JOBSPY_COUNTRY_INDEED }}"></div>
+        </div>
+        <div class="check">
+          <input type="checkbox" id="JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS" {% if defaults.JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS %}checked{% endif %}>
+          <label style="margin:0">Fetch full LinkedIn descriptions <span class="hint">— off starves BM25 and the screener</span></label>
+        </div>
+        <div class="check">
+          <input type="checkbox" id="SKIP_PREVIOUSLY_SELECTED" {% if defaults.SKIP_PREVIOUSLY_SELECTED %}checked{% endif %}>
+          <label style="margin:0">Skip jobs targeted in earlier runs</label>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Loops and bars</h2>
+        <div class="row">
+          <div><label>Job cycles</label><input type="number" id="MAX_JOB_SEARCH_CYCLES" value="{{ defaults.MAX_JOB_SEARCH_CYCLES }}"></div>
+          <div><label>Resume cycles</label><input type="number" id="MAX_RESUME_REVISE_CYCLES" value="{{ defaults.MAX_RESUME_REVISE_CYCLES }}"></div>
+        </div>
+        <div class="row">
+          <div><label>Job approval bar</label><input type="number" id="JUDGE_APPROVAL_SCORE" min="1" max="10" value="{{ defaults.JUDGE_APPROVAL_SCORE }}"></div>
+          <div><label>Resume approval bar</label><input type="number" id="RESUME_APPROVAL_SCORE" min="1" max="10" value="{{ defaults.RESUME_APPROVAL_SCORE }}"></div>
+        </div>
+        <div class="row">
+          <div><label>Viability floor <span class="hint">— below this, no resume</span></label><input type="number" id="MIN_VIABLE_JOB_SCORE" min="1" max="10" value="{{ defaults.MIN_VIABLE_JOB_SCORE }}"></div>
+          <div><label>Max pages</label><input type="number" id="RESUME_MAX_PAGES" value="{{ defaults.RESUME_MAX_PAGES }}"></div>
+        </div>
+        <div class="row">
+          <div><label>Preferred pages</label><input type="number" id="RESUME_PREFERRED_PAGES" value="{{ defaults.RESUME_PREFERRED_PAGES }}"></div>
+        </div>
+
+        <details>
+          <summary>Models</summary>
+          <label>Context</label><input type="text" id="MODEL_CONTEXT" value="{{ defaults.MODEL_CONTEXT }}">
+          <label>Planner</label><input type="text" id="MODEL_PLANNER" value="{{ defaults.MODEL_PLANNER }}">
+          <label>Screener</label><input type="text" id="MODEL_SCREENER" value="{{ defaults.MODEL_SCREENER }}">
+          <label>Writer</label><input type="text" id="MODEL_WRITER" value="{{ defaults.MODEL_WRITER }}">
+          <label>Judge</label><input type="text" id="MODEL_JUDGE" value="{{ defaults.MODEL_JUDGE }}">
+          <label>JD extractor</label><input type="text" id="MODEL_JD_EXTRACT" value="{{ defaults.MODEL_JD_EXTRACT }}">
+          <label>Eligibility</label><input type="text" id="MODEL_ELIGIBILITY" value="{{ defaults.MODEL_ELIGIBILITY }}">
+        </details>
+
+        <div class="actions">
+          <button class="primary" id="runBtn" onclick="startRun()">
+            <span class="spinner"></span><span id="runLabel">Run</span>
+          </button>
+          <button class="ghost" onclick="stopRun()">Stop</button>
+        </div>
+        <div class="err" id="err"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Progress</h2>
+        <div class="statusbar">
+          <span class="dot" id="dot"></span><span id="status">idle</span>
+        </div>
+        <div class="bar" id="bar"><span></span></div>
+
+        <ul class="stages" id="stages">
+          <li class="stage" data-stage="1">
+            <span class="marker"></span>
+            <span><span class="label">Reading your resume</span><span class="detail" id="d1"></span></span>
+          </li>
+          <li class="stage" data-stage="2">
+            <span class="marker"></span>
+            <span><span class="label">Finding &amp; vetting a job</span><span class="detail" id="d2"></span></span>
+          </li>
+          <li class="stage" data-stage="3">
+            <span class="marker"></span>
+            <span><span class="label">Writing &amp; reviewing the resume</span><span class="detail" id="d3"></span></span>
+          </li>
+          <li class="stage" data-stage="4">
+            <span class="marker"></span>
+            <span><span class="label">Rendering output</span><span class="detail" id="d4"></span></span>
+          </li>
+        </ul>
+
+        <div class="chips" id="chips"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Run log</h2>
+        <div id="log"></div>
+      </div>
+
+      <!-- Shown only when a gated run has parked a draft. The PDF does not
+           exist yet at this point: what you tick here is applied first, and
+           the render happens after. -->
+      <div class="panel" id="gate" style="display:none">
+        <h2>Suggestions — pick what goes in the PDF</h2>
+        <div id="gate-body"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Output files</h2>
+        <div id="outputs"></div>
+      </div>
+
+      <!-- Jobs already targeted are skipped when the next pool is built.
+           Deleting a job's output folder does NOT undo that — untick it
+           here to make the posting selectable again. -->
+      <div class="panel">
+        <h2>Job history <span class="hint" style="text-transform:none;letter-spacing:0">— skipped in future runs</span></h2>
+        <div id="history"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const NUMERIC = ["JOB_SCRAPE_CEILING","BM25_KEEP","POOL_SCREEN_MIN_FIT","POOL_SCREEN_BATCH_SIZE",
+  "POOL_SCREEN_SNIPPET_CHARS","JOB_SEARCH_DAYS_OLD","MAX_JOB_SEARCH_CYCLES","MAX_RESUME_REVISE_CYCLES",
+  "JUDGE_APPROVAL_SCORE","RESUME_APPROVAL_SCORE","MIN_VIABLE_JOB_SCORE","RESUME_MAX_PAGES","RESUME_PREFERRED_PAGES"];
+const TEXTUAL = ["JOB_SEARCH_SITES","JOBSPY_COUNTRY_INDEED","MODEL_CONTEXT","MODEL_PLANNER",
+  "MODEL_SCREENER","MODEL_WRITER","MODEL_JUDGE","MODEL_JD_EXTRACT","MODEL_ELIGIBILITY"];
+const BOOLEAN = ["JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS","SKIP_PREVIOUSLY_SELECTED"];
+
+let mode = "both", jobCount = 1, since = 0, polling = null, chips = {}, stageNow = 0, runStarted = null;
+
+function setMode(next) {
+  mode = next;
+  ["both", "search", "write"].forEach(m =>
+    document.getElementById("mode-" + m).classList.toggle("on", m === next));
+  document.getElementById("search-fields").style.display = next === "write" ? "none" : "";
+  document.getElementById("writer-fields").style.display = next === "write" ? "" : "none";
+  // The resume stages only exist when writing, so the tracker drops them.
+  document.querySelectorAll('.stage[data-stage="3"]').forEach(el =>
+    el.style.display = next === "search" ? "none" : "");
+}
+
+function setCount(n) {
+  jobCount = n;
+  document.querySelectorAll(".counts .count").forEach(b =>
+    b.classList.toggle("on", +b.dataset.n === n));
+}
+
+function collectSettings() {
+  const s = {};
+  NUMERIC.concat(TEXTUAL).forEach(k => {
+    const el = document.getElementById(k);
+    if (el && el.value !== "") s[k] = el.value;
+  });
+  BOOLEAN.forEach(k => { const el = document.getElementById(k); if (el) s[k] = el.checked; });
+  s.JOB_MATCH_COUNT = jobCount;
+  return s;
+}
+
+/* The pipeline already narrates itself in the log. Rather than inventing a
+   second progress signal that could drift from reality, the tracker reads
+   the same lines you'd read — so it can never claim a stage the run has
+   not actually reached. */
+function setStage(n, detail) {
+  if (n > stageNow) stageNow = n;
+  document.querySelectorAll(".stage").forEach(el => {
+    const s = +el.dataset.stage;
+    el.classList.toggle("done", s < stageNow);
+    el.classList.toggle("active", s === stageNow);
+  });
+  if (detail) document.getElementById("d" + n).textContent = detail;
+}
+
+function chip(key, text, tone) {
+  chips[key] = {text: text, tone: tone || ""};
+  document.getElementById("chips").innerHTML =
+    Object.values(chips).map(c => `<span class="chip ${c.tone}">${c.text}</span>`).join("");
+}
+
+function interpret(line) {
+  let m;
+  if (/\[1\/4\]/.test(line)) setStage(1, "reading the PDF…");
+  if (/\[2\/4\]/.test(line)) setStage(2, "planning search angles…");
+  if (/\[3\/4\]/.test(line)) setStage(3, "drafting…");
+  if (/\[4\/4\]/.test(line)) setStage(4, "building the PDF…");
+
+  if ((m = line.match(/Planned (\d+) search angle/))) setStage(2, `${m[1]} angles planned, scraping…`);
+  if ((m = line.match(/Scraped (\d+) unique posting/))) {
+    chip("scraped", `<b>${m[1]}</b> scraped`);
+    setStage(2, "ranking and screening…");
+  }
+  if ((m = line.match(/kept top (\d+)/))) chip("bm25", `<b>${m[1]}</b> after BM25`);
+  if ((m = line.match(/Dropped (\d+) posting\(s\) outside/))) chip("geo", `<b>${m[1]}</b> out of area`, "warn");
+  if ((m = line.match(/requirements section found in (\d+) of (\d+)/)))
+    chip("regex", `requirements found in <b>${m[1]}/${m[2]}</b>`);
+  if ((m = line.match(/Screened: (\d+) blocked, (\d+) dropped[^,]*, (\d+) unrated, (\d+) kept/))) {
+    chip("blocked", `<b>${m[1]}</b> blocked`, "warn");
+    chip("kept", `<b>${m[4]}</b> in pool`, "good");
+  }
+  if ((m = line.match(/(\d+) posting\(s\) rated 8\+/)))
+    chip("strong", `<b>${m[1]}</b> strong matches`, +m[1] > 0 ? "good" : "warn");
+  if ((m = line.match(/\[job cycle (\d+)\/(\d+)\]/))) setStage(2, `judging pick ${m[1]} of up to ${m[2]}…`);
+  if ((m = line.match(/job match: (\d+)\/10 \| approved: (\w+)/)))
+    chip("job", `job match <b>${m[1]}/10</b>`, m[2] === "True" ? "good" : "warn");
+  if ((m = line.match(/\[resume cycle (\d+)\/(\d+)\]/))) setStage(3, `draft ${m[1]} of up to ${m[2]}…`);
+  if ((m = line.match(/resume fitness: (\d+)\/10/))) chip("fit", `resume fitness <b>${m[1]}/10</b>`, "good");
+  if ((m = line.match(/Resume rendered to (\d+) page/))) chip("pages", `<b>${m[1]}</b> pages`, "good");
+  if ((m = line.match(/Selected (\d+) job\(s\)/))) chip("found", `<b>${m[1]}</b> job(s) selected`, "good");
+  if ((m = line.match(/--- Job (\d+) of (\d+)/))) setStage(3, `writing resume ${m[1]} of ${m[2]}…`);
+  if ((m = line.match(/(\d+) resume\(s\) written/))) chip("written", `<b>${m[1]}</b> resume(s)`, "good");
+  if (/Stopping/.test(line)) setStage(stageNow, "stopped — see the log");
+}
+
+function classify(line) {
+  if (/ERROR|Traceback|failed|could not/i.test(line)) return "bad";
+  if (/Warning|Note:|Heads up/i.test(line)) return "warn";
+  if (/approved: True|rendered to|Recorded|-> /.test(line)) return "ok";
+  return "";
+}
+
+function setRunning(on) {
+  document.getElementById("runBtn").disabled = on;
+  document.getElementById("runBtn").classList.toggle("busy", on);
+  document.getElementById("runLabel").textContent = on ? "Running…" : "Run";
+  document.getElementById("bar").classList.toggle("on", on);
+}
+
+function showError(msg) {
+  document.getElementById("err").textContent = msg;
+  setRunning(false);
+}
+
+async function startRun() {
+  document.getElementById("err").textContent = "";
+  setRunning(true);   // immediate feedback that the click registered
+  const jdFile = document.getElementById("jd_file").value;
+  const jdUrl = document.getElementById("jd_url").value.trim();
+
+  /* Everything below can throw: a non-JSON 500, a dropped connection, the
+     server not running. Without this catch the promise rejected silently
+     and the button simply did nothing — the least debuggable failure the
+     UI could have. */
+  try {
+    const res = await fetch("/run", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        mode: mode,
+        resume: document.getElementById("resume").value,
+        target_role: document.getElementById("target_role").value,
+        job_source: jdFile || jdUrl,
+        settings: collectSettings()
+      })
+    });
+
+    let data;
+    try {
+      data = await res.json();
+    } catch (e) {
+      showError(`Server returned ${res.status} with a non-JSON body — check the Flask terminal.`);
+      return;
+    }
+
+    if (!res.ok) { showError(data.error || `Could not start (HTTP ${res.status}).`); return; }
+
+    since = 0; chips = {}; stageNow = 0; runStarted = Date.now();
+    document.getElementById("log").innerHTML = "";
+    document.getElementById("chips").innerHTML = "";
+    document.querySelectorAll(".stage .detail").forEach(d => d.textContent = "");
+    if (!polling) polling = setInterval(poll, 1000);
+  } catch (e) {
+    showError("Could not reach the server: " + e.message);
+  }
+}
+
+async function stopRun() {
+  try {
+    const res = await fetch("/stop", {method: "POST"});
+    const data = await res.json();
+    if (!res.ok) document.getElementById("err").textContent = data.error || "";
+  } catch (e) {
+    document.getElementById("err").textContent = "Could not reach the server: " + e.message;
+  }
+}
+
+async function poll() {
+  let data;
+  try {
+    const res = await fetch("/log?since=" + since);
+    data = await res.json();
+  } catch (e) {
+    return;   // transient; the next tick retries
+  }
+  since = data.next;
+
+  if (data.lines.length) {
+    const log = document.getElementById("log");
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    data.lines.forEach(line => {
+      interpret(line);
+      const div = document.createElement("div");
+      div.className = "ln " + classify(line);
+      div.textContent = line;
+      log.appendChild(div);
+    });
+    /* Only autoscroll if you were already at the bottom — otherwise
+       scrolling back to read something gets yanked away every second. */
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  const running = data.status === "running";
+  const dot = document.getElementById("dot");
+  dot.className = "dot " + (running ? "running" : data.status === "finished" ? "finished"
+    : data.status === "idle" ? "" : "failed");
+
+  let label = data.status;
+  if (running && runStarted) {
+    const s = Math.floor((Date.now() - runStarted) / 1000);
+    label = `running — ${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  }
+  document.getElementById("status").textContent = label;
+
+  if (!running) {
+    setRunning(false);
+    if (polling) { clearInterval(polling); polling = null; }
+    if (data.status === "finished") setStage(5);
+    loadOutputs();
+    loadPending();   // a finished run may have parked a draft rather than rendered one
+    loadHistory();   // a completed run adds its pick to the ledger
+  }
+}
+
+/* ---------- Suggestion gate ----------
+   A gated run ends without a PDF: the draft and the judge's suggestions sit
+   on the server until a decision is made here. Rendering is what happens
+   AFTER this panel, which is the whole point of it — suggestions arriving
+   alongside a finished PDF could only be acted on by running again. */
+let pendingRuns = [];
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
+
+function renderGate() {
+  const panel = document.getElementById("gate");
+  if (!pendingRuns.length) { panel.style.display = "none"; return; }
+  panel.style.display = "";
+
+  document.getElementById("gate-body").innerHTML = pendingRuns.map((run, r) => {
+    const boxes = (run.suggestions || []).map((text, i) => `
+      <label class="sugg" data-run="${r}">
+        <input type="checkbox" data-run="${r}" data-i="${i + 1}"
+               onchange="this.closest('.sugg').classList.toggle('on', this.checked)">
+        <span>${escapeHtml(text)}</span>
+      </label>`).join("");
+
+    return `
+      <div class="gate-run" data-run="${r}">
+        <div class="gate-job">${escapeHtml(run.job_title || "Resume")}${
+          run.company ? " — " + escapeHtml(run.company) : ""}</div>
+        <div class="gate-meta">fitness ${escapeHtml(run.fitness_score)}/10 ·
+          ${escapeHtml(run.fitness_summary || "")}</div>
+        ${boxes}
+        <div class="gate-actions">
+          <button class="linkish" onclick="toggleAll(${r}, true)">Select all</button>
+          <button class="linkish" onclick="toggleAll(${r}, false)">Clear</button>
+          <span class="spacer"></span>
+          <button class="primary" onclick="finalize(${r})">Apply &amp; make PDF</button>
+        </div>
+      </div>`;
+  }).join('<hr style="border:0;border-top:1px solid var(--border);margin:16px 0">');
+}
+
+function toggleAll(runIndex, on) {
+  document.querySelectorAll(`#gate-body input[data-run="${runIndex}"]`).forEach(box => {
+    box.checked = on;
+    box.closest(".sugg").classList.toggle("on", on);
+  });
+}
+
+async function finalize(runIndex) {
+  const run = pendingRuns[runIndex];
+  if (!run) return;
+  const selected = Array.from(
+    document.querySelectorAll(`#gate-body input[data-run="${runIndex}"]:checked`)
+  ).map(box => +box.dataset.i);
+
+  document.getElementById("err").textContent = "";
+  setRunning(true);
+  try {
+    const res = await fetch("/finalize", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({pending_id: run.pending_id, selected: selected})
+    });
+    let data;
+    try { data = await res.json(); }
+    catch (e) {
+      showError(`Server returned ${res.status} with a non-JSON body — check the Flask terminal.`);
+      return;
+    }
+    if (!res.ok) { showError(data.error || `Could not finalize (HTTP ${res.status}).`); return; }
+
+    /* The gate closes for this job only once the server has taken the
+       work — not on click. A 409 or a validation error leaves the boxes
+       exactly as they were, so nothing has to be re-ticked. */
+    pendingRuns.splice(runIndex, 1);
+    renderGate();
+    since = 0; runStarted = Date.now();
+    document.getElementById("log").innerHTML = "";
+    setStage(4, "applying your picks, then rendering…");
+    if (!polling) polling = setInterval(poll, 1000);
+  } catch (e) {
+    showError("Could not reach the server: " + e.message);
+  }
+}
+
+async function loadPending() {
+  try {
+    const res = await fetch("/pending");
+    pendingRuns = await res.json();
+  } catch (e) {
+    pendingRuns = [];
+  }
+  renderGate();
+}
+
+/* ---------- Job history ----------
+   The ledger of postings already targeted. It lives outside data/output/
+   on purpose, so binning a resume folder doesn't quietly make its job
+   selectable again; that has to be asked for, which is what this does. */
+let historyRows = [];
+
+async function loadHistory() {
+  try {
+    const res = await fetch("/history");
+    historyRows = await res.json();
+  } catch (e) {
+    historyRows = [];
+  }
+  const box = document.getElementById("history");
+  if (!historyRows.length) {
+    box.innerHTML = '<span class="note">No jobs on file — nothing is being skipped.</span>';
+    return;
+  }
+  box.innerHTML = historyRows.map(row => `
+    <label class="sugg">
+      <input type="checkbox" class="hist" data-n="${row.n}"
+             onchange="this.closest('.sugg').classList.toggle('on', this.checked)">
+      <span>${escapeHtml(row.job_title || "(untitled)")}${
+        row.company ? " — " + escapeHtml(row.company) : ""}
+        <span class="hint">${escapeHtml(row.run || "")}</span></span>
+    </label>`).join("") + `
+    <div class="gate-actions">
+      <span class="note" style="margin:0">${historyRows.length} job(s) on file</span>
+      <span class="spacer"></span>
+      <button class="ghost" onclick="forgetHistory()">Allow selected again</button>
+    </div>`;
+}
+
+async function forgetHistory() {
+  const keys = Array.from(document.querySelectorAll("#history input.hist:checked"))
+    .map(box => +box.dataset.n);
+  if (!keys.length) return;
+  try {
+    const res = await fetch("/history/forget", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({keys: keys})
+    });
+    const data = await res.json();
+    if (!res.ok) { document.getElementById("err").textContent = data.error || ""; return; }
+    /* Reload rather than splicing locally: removing rows renumbers the
+       rest, and a stale numbering here would forget the wrong job next
+       time. */
+    loadHistory();
+  } catch (e) {
+    document.getElementById("err").textContent = "Could not reach the server: " + e.message;
+  }
+}
+
+async function loadOutputs() {
+  try {
+    const res = await fetch("/outputs");
+    const files = await res.json();
+    /* Names are now paths like "20260920_1_RBC_Data-Scientist/resume.pdf".
+       Each segment is encoded separately — encoding the whole string would
+       turn the separator into %2F, which the server will not route. */
+    const href = name => "/outputs/" + name.split("/").map(encodeURIComponent).join("/");
+    document.getElementById("outputs").innerHTML = files.length
+      ? files.map((f, i) => `<a href="${href(f.name)}" target="_blank">${f.name}` +
+          (i < 2 && runStarted ? '<span class="fresh">new</span>' : '') + `</a>`).join("")
+      : '<span class="note">Nothing yet.</span>';
+  } catch (e) {
+    document.getElementById("outputs").innerHTML = '<span class="note">Could not list outputs.</span>';
+  }
+}
+
+loadOutputs();
+loadPending();
+loadHistory();
+poll();
+</script>
+</body>
+</html>

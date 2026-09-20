@@ -110,6 +110,42 @@ The loop also stops early when a revision fails to improve on the
 previous cycle's score — that pattern means the remaining objections
 aren't fixable by rewriting.
 
+### Stage 3 — you pick what goes in
+
+When the loop ends, the judge usually still has suggestions it never
+applied. Those used to be reported *after* the PDF was rendered, which
+made them advice about a finished document — actionable only by running
+the whole pipeline again.
+
+So the run now **stops before rendering**. It saves the approved draft
+and the outstanding suggestions, and waits. You tick the ones you want,
+the writer applies **only those** in a final pass, and the PDF is
+rendered after that.
+
+In the web UI a **Suggestions** panel appears with checkboxes. From the
+CLI:
+
+```bash
+python finalize.py --list          # what's waiting, with numbered suggestions
+python finalize.py <id> 1,3        # apply those two
+python finalize.py <id> all
+python finalize.py <id> none       # render the draft untouched
+```
+
+The final pass is deliberately the narrowest call in the pipeline: the
+writer is told to apply the listed edits and leave everything else
+byte-for-byte alone. By this point you have read and approved the draft,
+so a revision that also "improved" three untouched bullets would undo a
+decision you already made.
+
+A paused run is a file on disk (`data/work/pending/`), not a blocked
+process — close the browser, decide tomorrow, nothing is holding open.
+When the judge leaves no suggestions at all, the run renders directly
+rather than making you click through an empty list.
+
+Set `SUGGESTION_GATE = False` to restore the old straight-through
+behaviour.
+
 ## Setup
 
 1. **Create an environment**
@@ -154,8 +190,8 @@ aren't fixable by rewriting.
    - `GITHUB_PAT` — leave blank (see "GitHub integration")
 
    JobSpy needs **no API key**. If you see repeated empty results or
-   429s, LinkedIn is rate-limiting — lower `JOB_POOL_OVERSCAN_FACTOR`
-   or add proxies (see `tools/jobspy_tool.py`).
+   429s, LinkedIn is rate-limiting — lower `JOB_SCRAPE_CEILING` or add
+   proxies (see `tools/jobspy_tool.py`).
 
    > **Never commit `.env`.** It's in `.gitignore`. If a key is ever
    > exposed, rotate it immediately at the provider.
@@ -166,6 +202,24 @@ aren't fixable by rewriting.
    as a layout template (see "Sample resume").
 
 ## Usage
+
+### Web UI
+
+A local Flask control panel that puts every tuning knob on one form,
+streams the run log live, shows the suggestion checkboxes, and lets you
+edit the job history:
+
+```bash
+python webapp/app.py     # then open http://127.0.0.1:5001
+```
+
+Settings there override `config.py` **for one run only** — they go into
+the subprocess's environment, so nothing on disk changes and `config.py`
+stays the single source of truth for what each knob means. It binds to
+`127.0.0.1` and has no authentication; it runs pipeline invocations with
+your API keys in their environment and is not built to face a network.
+
+### CLI
 
 **Search mode** — the role description steers every search angle, so
 be specific:
@@ -211,17 +265,35 @@ tailored against a cookie wall would look exactly like a successful run.
 
 ## Output
 
-Everything lands in `data/output/`, timestamped per run:
+Each job gets its own folder under `data/output/`, named
+`<timestamp>_<company>_<title>` so the listing sorts chronologically and
+is identifiable at a glance:
 
-- `tailored_resume_<ts>.md` — the resume (Markdown)
-- `tailored_resume_<ts>.pdf` — the same resume, styled for print
-- `resume_review_<ts>.html` — job match assessment, resume fitness
-  score, strengths, gaps, suggestions, the application link, and the
-  writer's notes
-- `resume_review_<ts>.json` — full cycle-by-cycle history
-- `job_pool_<ts>.json` — the screened pool (search mode only)
-- `selected_jobs.json` — running cross-run ledger (see below)
-- `logs/run_<ts>.log` — full run log
+```
+data/output/20260920_164005_1_Acme_Senior-Data-Scientist/
+├── resume.pdf     # the resume, styled for print
+└── review.html    # job match assessment, resume fitness score, strengths,
+                   # gaps, suggestions, the application link, writer's notes
+```
+
+That folder holds only what you'd actually open. Everything else the run
+produces is an intermediate and goes to `data/work/`:
+
+- `tailored_resume_<ts>.md` — the resume as Markdown. It exists so a
+  WeasyPrint failure can't lose the resume text, and so the suggestion
+  gate can read the draft back.
+- `resume_review_<ts>.json` — full cycle-by-cycle history, for when you
+  want to see exactly what the judge said.
+- `job_pool_<ts>.json` — the screened pool (search mode only), so a
+  crashed run doesn't have to be re-scraped to see what it was choosing
+  between.
+- `pending/` — paused-run state for the suggestion gate.
+
+And two things live at the `data/` root because they are neither
+deliverables nor disposable:
+
+- `data/logs/run_<ts>.log` — full run log
+- `data/selected_jobs.json` — the cross-run ledger (see below)
 
 **The PDF carries resume content and nothing else** — no notes, no page
 numbers, no commentary. The writer is instructed to end its draft with a
@@ -304,9 +376,9 @@ cost a full cycle out of three.
 
 ## Duplicate filtering
 
-Each run's final job pick is appended to `data/output/selected_jobs.json`.
-On later runs those postings are filtered out of the pool before
-screening, so consecutive runs don't keep landing on the same job.
+Each run's final job pick is appended to `data/selected_jobs.json`. On
+later runs those postings are filtered out of the pool before screening,
+so consecutive runs don't keep landing on the same job.
 
 Matching is on normalized URL **and** on a company+title fingerprint,
 since the same opening is routinely posted to several boards under
@@ -314,9 +386,27 @@ different URLs. Only the final pick is recorded — picks the judge
 rejected mid-run stay available, since they were often rejected only
 because something better sat beside them that week.
 
-Set `SKIP_PREVIOUSLY_SELECTED = False` to disable, e.g. to regenerate a
-resume for a job you already targeted. Note `data/output/` is
-gitignored, so the ledger is local-only.
+The ledger deliberately lives **outside `data/output/`**. Deleting a
+job's output folder does not put the posting back in play, and shouldn't:
+the folder holds a rendered PDF, while the ledger records that you
+targeted the job. Tidying disk and undoing a decision are different
+things.
+
+So undoing it is explicit. In the web UI, the **Job history** panel lists
+what's on file with checkboxes and an "Allow selected again" button. From
+the CLI:
+
+```bash
+python job_history.py --list
+python job_history.py --forget 2,5      # by row number
+python job_history.py --forget acme     # by company, title or URL text
+python job_history.py --clear
+```
+
+Forgetting a job does **not** delete the resume produced for it — you may
+want to keep the PDF while allowing a fresh attempt.
+
+Set `SKIP_PREVIOUSLY_SELECTED = False` to disable filtering entirely.
 
 ## Resume appearance
 
@@ -378,7 +468,7 @@ Edit that one file to recalibrate as the market shifts.
 ## Logging
 
 - **Console** — step-by-step run narration at INFO.
-- **`data/output/logs/run_<ts>.log`** — the same narration **plus**
+- **`data/logs/run_<ts>.log`** — the same narration **plus**
   exceptions and tool/parse failures with tracebacks, timestamped and
   tagged by module. A full record of the run, not just its failures, so
   two runs can be diffed when tuning prompts.
@@ -437,8 +527,9 @@ All in `config.py`.
   point wide: only a 7/10 pick earns a resume without being approved.
 
 **Search and pool**
-- `JOB_SEARCH_HOURS_OLD` (336, two weeks) and `JOB_SEARCH_TBS`
-  (`"qdr:w2"`) — keep these two in sync
+- `JOB_SEARCH_DAYS_OLD` (14) — max posting age, in days. `JOB_SEARCH_TBS`
+  (Firecrawl's window) and the `hours_old` JobSpy actually takes are both
+  derived from it, so they can't drift out of sync.
 - `JOB_SEARCH_SITES` (`["linkedin", "indeed"]`) — ZipRecruiter and
   Glassdoor are valid but off by default; their Cloudflare protection
   reliably 403s JobSpy. A circuit breaker drops any site that proves
@@ -457,6 +548,8 @@ All in `config.py`.
 
 **Resume**
 - `RESUME_MAX_PAGES` (3), `RESUME_PREFERRED_PAGES` (2)
+- `SUGGESTION_GATE` (True) — pause before rendering so you can pick which
+  of the judge's suggestions make it into the PDF
 - `SKIP_PREVIOUSLY_SELECTED` (True)
 
 ## GitHub integration (deferred)
@@ -489,13 +582,21 @@ resume-agent/
 │   ├── bm25_tool.py       # lexical pre-filter: rank the scrape against the resume
 │   ├── posting_sections.py # reorder a posting requirements-first for the screener
 │   └── firecrawl_tool.py  # SUPPORT: fallback search + single-URL scraping
-├── job_history.py         # cross-run ledger of selected jobs
+├── job_history.py         # cross-run ledger of selected jobs (+ CLI to edit it)
+├── pending.py             # paused-run state for the suggestion gate
+├── finalize.py            # apply the picked suggestions, then render
 ├── html_renderer.py       # review page + early-stop report pages
 ├── pdf_renderer.py        # resume Markdown -> styled PDF (all appearance lives here)
-├── logger_setup.py        # console + per-run file logging
+├── logger_setup.py        # console + per-run file logging, prompt-cache accounting
+├── webapp/
+│   ├── app.py             # local Flask control panel
+│   └── templates/
 ├── data/
 │   ├── input/             # your resume, optional sample_resume.pdf, saved JDs
-│   └── output/            # generated resume, review, pool, ledger, logs
+│   ├── output/            # one folder per job: resume.pdf + review.html
+│   ├── work/              # markdown, review JSON, job pool, pending state
+│   ├── logs/              # run_<ts>.log
+│   └── selected_jobs.json # cross-run ledger
 ├── config.py              # keys, model routing, every tuning knob
 ├── main.py                # entry point: both pipelines
 └── requirements.txt
@@ -525,6 +626,33 @@ quality are evaluative, multi-factor calls, not generation tasks.
   WeasyPrint library issue costs the PDF format only.
 
 ## Cost notes
+
+**Prompt caching is on** for the writer and both judges. Every call in
+those loops resends the same prefix — the system prompt, the layout
+template, your context, the job's requirements — and only the draft or
+the posting under review changes, so the varying material is placed after
+the cache breakpoint and the ~7k-token prefix is read back at a tenth of
+base input price. The saving is measurable but small in dollars; the
+latency on re-reading that prefix is what you actually feel. Every run
+ends with a per-stage summary:
+
+```
+Prompt cache (tokens):
+  writer         3 call(s) | read 14200 | written 7100 | uncached 4300 | 67% of cached tokens were hits
+  resume judge   3 call(s) | read 16800 | written 8400 | uncached 5100 | 67% of cached tokens were hits
+```
+
+Writes climbing while reads stay at zero means a breakpoint has landed on
+something that changes per call. A stage reading `not cached` means its
+prefix fell under the model's minimum cacheable length — 1,024 tokens on
+Sonnet, 4,096 on Haiku — which the API never errors on. The screener is
+deliberately **not** cached for that reason; its prefix is marginal
+against Haiku's floor, and a wrong guess there costs 25 wasted writes per
+batch.
+
+The five-minute default TTL also means the suggestion gate's final writer
+call usually misses — it fires whenever you tick the boxes, which may be
+hours later. That's one call, so it's left as is.
 
 - Sonnet 5 handles context, writing and judging; the judge's adaptive
   thinking adds reasoning tokens (billed as output) at both stages.

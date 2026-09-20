@@ -137,6 +137,69 @@ def get_run_timestamp() -> str | None:
 
 _MODELS_SEEN: set[tuple[str, str]] = set()
 
+# Per-stage cache accounting, accumulated across a run. Totals rather
+# than per-call lines on purpose: the screener alone makes six calls and
+# a line each would bury the narration, while the number that actually
+# tells you whether caching is working is the ratio over the whole run.
+_CACHE_TOTALS: dict[str, dict[str, int]] = {}
+
+
+def note_cache(stage: str, response) -> None:
+    """
+    Accumulate one response's prompt-cache usage against its stage.
+
+    The three fields do not overlap: `input_tokens` counts only what came
+    AFTER the last cache breakpoint, so the true input total for a call is
+    all three added together. Recording them separately is what makes a
+    miss visible — a stage whose writes keep climbing while reads stay at
+    zero has a breakpoint sitting on content that changes every request.
+
+    Never raises; diagnostics must not be able to fail a run.
+    """
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        totals = _CACHE_TOTALS.setdefault(
+            stage, {"read": 0, "write": 0, "fresh": 0, "calls": 0}
+        )
+        totals["read"] += getattr(usage, "cache_read_input_tokens", 0) or 0
+        totals["write"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
+        totals["fresh"] += getattr(usage, "input_tokens", 0) or 0
+        totals["calls"] += 1
+    except Exception:  # noqa: BLE001 - diagnostics must never break the pipeline
+        pass
+
+
+def log_cache_summary(logger: logging.Logger) -> None:
+    """
+    Report what prompt caching actually did this run, per stage.
+
+    Worth reading for two numbers. Reads should dominate on any stage that
+    makes more than one call — they are billed at a tenth of base input.
+    Writes with no matching reads are the failure mode: the cache entry
+    was paid for at 1.25x and never used, which is what happens when the
+    breakpoint moved, the effort/thinking settings changed between calls,
+    or more than five minutes passed between them.
+
+    A stage showing zeros in every column did not cache at all, almost
+    always because the prefix fell below the model's minimum cacheable
+    length (1,024 tokens on Sonnet, 4,096 on Haiku). That is silent by
+    design in the API — no error is returned — so this line is the only
+    place it shows up.
+    """
+    if not _CACHE_TOTALS:
+        return
+    logger.info("\nPrompt cache (tokens):")
+    for stage, totals in _CACHE_TOTALS.items():
+        cached = totals["read"] + totals["write"]
+        share = (totals["read"] / cached * 100) if cached else 0
+        logger.info(
+            "  %-14s %d call(s) | read %d | written %d | uncached %d%s",
+            stage, totals["calls"], totals["read"], totals["write"], totals["fresh"],
+            f" | {share:.0f}% of cached tokens were hits" if cached else " | not cached",
+        )
+
 
 def note_model(logger: logging.Logger, stage: str, response) -> None:
     """

@@ -25,7 +25,7 @@ employers, so it's not the place to cut cost.
 import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL_WRITER, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES
-from logger_setup import get_logger, note_model
+from logger_setup import get_logger, note_model, note_cache
 
 log = get_logger(__name__)
 
@@ -72,7 +72,14 @@ Markdown output naturally avoids these, but do not try to simulate columns \
 with pipe tables or side-by-side content either.
 - Contact info (name, phone, email, location, LinkedIn/portfolio if the \
 candidate has one) goes in plain text at the very top, not embedded in an \
-image, header, or footer.
+image, header, or footer. The candidate's NAME must be the document's \
+first line and must be written as a level-1 Markdown heading — `# Jane \
+Doe` — never as plain text and never bold. This holds even when the \
+template resume shows the name as an ordinary line: a template extracted \
+from a PDF carries no Markdown, so it cannot show you this, and a name \
+emitted as plain text renders in the PDF at contact-line size and colour \
+instead of as the title. Any professional tagline under the name goes on \
+its own line immediately after, in **bold**.
 - Standard, unambiguous date formats for every role and degree (e.g. "Jan \
 2022 – Present", "2019 – 2022") — consistent format throughout the whole \
 document, not mixed styles.
@@ -117,6 +124,8 @@ numbers, or achievements. It supplies structure; the candidate supplies \
 every fact. If no template is given, use the standard ATS section set below.
 
 Self-check before you output (fix any that fail):
+- The first line is `# <candidate's full name>` — a level-1 heading, not \
+plain text, not bold.
 - Every entry within a section uses the identical header shape.
 - No section label is repeated as the first words of its own content \
 (never a "Certifications" section whose first bullet begins "Certifications:").
@@ -176,6 +185,49 @@ draft. Preserve what the judge called out as a strength."""
 # fails the whole run.
 MAX_OUTPUT_TOKENS = 32000
 WRITER_EFFORT = "medium"
+
+
+# --- Prompt caching ----------------------------------------------------
+# Every call in this module resends the same four things: this system
+# prompt, the template resume, the candidate's context, and the target
+# job's requirements. Across one job that is a draft plus up to two
+# revisions plus the final apply pass, all within a few minutes of each
+# other — the exact shape prompt caching is for. Cache reads bill at a
+# tenth of base input, so the repeats become close to free, and the
+# latency saving on re-reading ~7k tokens is the part you actually feel.
+#
+# TWO BREAKPOINTS, both on content that does not change between calls:
+#   1. the system prompt
+#   2. the end of the job block in the user message
+# The varying material — the previous draft, the judge's feedback, the
+# selected edits — is deliberately placed AFTER the second breakpoint.
+# That ordering is the whole trick: a breakpoint on a block that changes
+# every request writes a fresh entry each time and never reads one, which
+# costs 1.25x and saves nothing.
+#
+# WRITER_EFFORT must stay constant across these calls. The effort value is
+# rendered into the prompt, so changing it between cycles invalidates the
+# message cache.
+_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _system_blocks() -> list[dict]:
+    """The system prompt as a single cached block."""
+    return [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": _CACHE_CONTROL}]
+
+
+def _user_blocks(stable: str, varying: str) -> list[dict]:
+    """
+    Split the user message into a cacheable prefix and a varying tail.
+
+    `stable` is everything identical across this job's calls (template,
+    settled gaps, candidate context, job requirements); `varying` is what
+    differs per call. Only the first carries the breakpoint.
+    """
+    blocks = [{"type": "text", "text": stable, "cache_control": _CACHE_CONTROL}]
+    if varying.strip():
+        blocks.append({"type": "text", "text": varying})
+    return blocks
 
 
 def _extract_text(response, where: str) -> str:
@@ -305,16 +357,18 @@ def draft_resume(
             model=MODEL_WRITER,
             max_tokens=MAX_OUTPUT_TOKENS,
             output_config={"effort": WRITER_EFFORT},
-            system=SYSTEM_PROMPT,
+            system=_system_blocks(),
             messages=[
                 {
                     "role": "user",
-                    "content": (
-                        f"{_template_block(style_template)}"
-                        f"{_settled_gaps_block(job_review)}"
-                        f"Candidate background:\n{candidate_context}\n\n"
-                        f"{job_block}\n"
-                        "Draft the tailored, ATS-ready resume now."
+                    "content": _user_blocks(
+                        stable=(
+                            f"{_template_block(style_template)}"
+                            f"{_settled_gaps_block(job_review)}"
+                            f"Candidate background:\n{candidate_context}\n\n"
+                            f"{job_block}"
+                        ),
+                        varying="Draft the tailored, ATS-ready resume now.",
                     ),
                 }
             ],
@@ -328,6 +382,7 @@ def draft_resume(
         ) from exc
 
     note_model(log, "writer", response)
+    note_cache("writer", response)
     draft = _extract_text(response, "writer.draft_resume")
     if not draft.strip():
         # Fail loudly rather than returning "". An empty draft would otherwise
@@ -386,19 +441,23 @@ def revise_resume(
             model=MODEL_WRITER,
             max_tokens=MAX_OUTPUT_TOKENS,
             output_config={"effort": WRITER_EFFORT},
-            system=SYSTEM_PROMPT,
+            system=_system_blocks(),
             messages=[
                 {
                     "role": "user",
-                    "content": (
-                        f"{_template_block(style_template)}"
-                        f"{_settled_gaps_block(job_review)}"
-                        f"Candidate background:\n{candidate_context}\n\n"
-                        f"{job_block}\n"
-                        f"Your previous draft:\n{previous_draft}\n\n"
-                        f"Judge's feedback on that draft:\n{feedback_block}\n\n"
-                        "Revise the resume now, addressing the feedback directly "
-                        "while keeping it ATS-ready and faithful to the template."
+                    "content": _user_blocks(
+                        stable=(
+                            f"{_template_block(style_template)}"
+                            f"{_settled_gaps_block(job_review)}"
+                            f"Candidate background:\n{candidate_context}\n\n"
+                            f"{job_block}"
+                        ),
+                        varying=(
+                            f"Your previous draft:\n{previous_draft}\n\n"
+                            f"Judge's feedback on that draft:\n{feedback_block}\n\n"
+                            "Revise the resume now, addressing the feedback directly "
+                            "while keeping it ATS-ready and faithful to the template."
+                        ),
                     ),
                 }
             ],
@@ -412,11 +471,124 @@ def revise_resume(
         ) from exc
 
     note_model(log, "writer", response)
+    note_cache("writer", response)
     revised = _extract_text(response, "writer.revise_resume")
     if not revised.strip():
         log.error(
             "writer.revise_resume: falling back to the previous draft so the "
             "pipeline doesn't lose content."
+        )
+        return previous_draft
+    return revised
+
+
+def apply_selected_suggestions(
+    candidate_context: str,
+    job: dict,
+    previous_draft: str,
+    selected: list[str],
+    style_template: str | None = None,
+    job_review: dict | None = None,
+) -> str:
+    """
+    Apply ONLY the suggestions the user ticked, and change nothing else.
+
+    The last step before rendering, and deliberately the narrowest call in
+    this module. revise_resume() hands the writer a whole critique and
+    invites a rewrite; this one hands it a short list the user chose and
+    forbids everything outside it. The difference matters because the user
+    has by this point read and approved the draft as it stands — a
+    revision that also "improved" three untouched bullets would silently
+    undo a decision they already made.
+
+    Args:
+        selected: The suggestion strings the user ticked. An empty list
+            means the draft is accepted as-is; no API call is made.
+
+    Returns:
+        The revised Markdown, or previous_draft unchanged when nothing was
+        selected or the model returned nothing.
+    """
+    if not selected:
+        log.info("  No suggestions selected — rendering the draft as approved.")
+        return previous_draft
+
+    listed = "\n".join(f"{i}. {item}" for i, item in enumerate(selected, 1))
+    job_block = (
+        f"Target job: {job.get('job_title')} at {job.get('company')} "
+        f"({job.get('location')})\n"
+        f"Requirements/responsibilities:\n{job.get('full_requirements')}\n"
+    )
+    instruction = (
+        "=== APPLY EXACTLY THESE EDITS, AND NOTHING ELSE ===\n"
+        f"{listed}\n"
+        "=== END EDITS ===\n\n"
+        "The candidate has read this draft and chose these specific edits "
+        "from a longer list of options. The items they did NOT choose were "
+        "rejected on purpose. So: apply each numbered edit above, and leave "
+        "every other part of the draft byte-for-byte as it is. Do not "
+        "rephrase untouched bullets, do not reorder sections, do not "
+        "re-balance length, do not fix anything you think is wrong but was "
+        "not listed. If applying an edit forces a change elsewhere (a "
+        "length cap, a duplicated phrase), make the smallest change that "
+        "resolves it and nothing more.\n\n"
+        "Keep the resume ATS-ready, within the page cap, faithful to the "
+        "template, and keep the trailing Notes section. Output the complete "
+        "revised resume in Markdown — the whole document, not a diff."
+    )
+
+    try:
+        with client.messages.stream(
+            model=MODEL_WRITER,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            output_config={"effort": WRITER_EFFORT},
+            system=_system_blocks(),
+            messages=[
+                {
+                    "role": "user",
+                    # Same prefix the draft/revise calls wrote, so a quick
+                    # decision reads it back. A slow one will not: the
+                    # default cache lifetime is five minutes and this call
+                    # fires whenever the checkboxes are submitted. Marked
+                    # anyway — the downside of a miss is one write at 1.25x
+                    # on a single call, which is cheaper than the hit is
+                    # worth when it lands.
+                    "content": _user_blocks(
+                        stable=(
+                            f"{_template_block(style_template)}"
+                            f"{_settled_gaps_block(job_review)}"
+                            f"Candidate background:\n{candidate_context}\n\n"
+                            f"{job_block}"
+                        ),
+                        varying=(
+                            f"The approved draft:\n{previous_draft}\n\n"
+                            f"{instruction}"
+                        ),
+                    ),
+                }
+            ],
+        ) as stream:
+            response = stream.get_final_message()
+    except anthropic.APIError as exc:
+        log.error(
+            "writer.apply_selected_suggestions: Anthropic API call failed: %s",
+            exc, exc_info=True,
+        )
+        raise RuntimeError(
+            f"writer.apply_selected_suggestions: failed to reach the Anthropic "
+            f"API ({exc}). Check your ANTHROPIC_API_KEY and network connection."
+        ) from exc
+
+    note_model(log, "writer", response)
+    note_cache("writer", response)
+    revised = _extract_text(response, "writer.apply_selected_suggestions")
+    if not revised.strip():
+        # Same reasoning as revise_resume: an approved draft in hand beats
+        # losing it to an empty response. The user's selections are lost,
+        # but the resume is not.
+        log.error(
+            "writer.apply_selected_suggestions: model returned nothing — "
+            "rendering the approved draft without the selected edits."
         )
         return previous_draft
     return revised

@@ -412,6 +412,7 @@ STOP_TEMPLATE = """<!DOCTYPE html>
   .subtitle {{ color: var(--muted); margin: 0 0 20px 0; }}
   .banner {{ padding: 14px 18px; border-radius: 6px; font-weight: 600;
              background: #fdecea; color: var(--bad); border: 1px solid #f3c2bd; }}
+  .banner.ok {{ background: #e8f5ec; color: #1e7b34; border-color: #bfe0c9; }}
   .reason {{ margin: 16px 0 0 0; font-size: 1.05em; white-space: pre-wrap; }}
   .considered {{ border: 1px solid var(--border); border-radius: 8px;
                  padding: 14px 18px; margin-bottom: 12px; }}
@@ -431,7 +432,7 @@ STOP_TEMPLATE = """<!DOCTYPE html>
     <h1>{title}</h1>
     <p class="subtitle">{subtitle}</p>
 
-    <div class="banner">{banner}</div>
+    <div class="banner {banner_class}">{banner}</div>
     <p class="reason">{reason}</p>
 
 {sections_html}
@@ -460,18 +461,23 @@ def _render_stop_page(
     run_timestamp: str | None,
 ) -> str:
     """
-    Shared renderer for every page that reports a run stopping early.
+    Shared renderer for every page that ends a run early or without a
+    resume.
 
     One template, several callers: a run can end before the writing stage
-    for reasons that have nothing in common (nothing worth applying to vs
-    a posting that couldn't be fetched), and each needs its own "what to
-    try next". Only the sections differ.
+    for reasons with nothing in common (nothing worth applying to, a
+    posting that couldn't be fetched, or writing simply switched off), and
+    each needs its own sections and "what next". An empty `reason` is a
+    normal case — a successful search-only run has nothing to explain.
     """
     try:
         return STOP_TEMPLATE.format(
             title=escape(title),
             subtitle=escape(subtitle),
             banner=escape(banner),
+            # Only a successful search-only run passes an empty reason, so
+            # this doubles as the signal for a non-alarming banner.
+            banner_class="ok" if not reason else "",
             reason=escape(reason),
             sections_html=sections_html,
             run_timestamp=escape(str(run_timestamp or "unknown")),
@@ -567,6 +573,88 @@ def render_no_job_html(
         subtitle="No resume was written for this run.",
         banner="No suitable job found — pipeline stopped before the writing stage",
         reason=reason,
+        sections_html=sections,
+        run_timestamp=run_timestamp,
+    )
+
+
+def render_jobs_found_html(
+    selections: list[dict],
+    target_role: str,
+    pool_size: int,
+    run_timestamp: str | None = None,
+    title: str = "Jobs found",
+) -> str:
+    """
+    Render the page produced by a SEARCH-ONLY run.
+
+    No resume was written, so this is the run's only output: the jobs
+    worth applying to, each with the judge's score, verdict and concerns,
+    and a link to apply. Approved picks are distinguished from ones that
+    merely cleared the viability floor — collapsing the two would hide
+    exactly the information that decides which to act on first.
+
+    Note that a search-only run does NOT write to selected_jobs.json, so
+    every posting here is still available to a later run that writes
+    resumes for them.
+    """
+    blocks = []
+    for index, selection in enumerate(selections, 1):
+        job = selection.get("job", {}) or {}
+        review = selection.get("review", {}) or {}
+        score = review.get("job_match_score")
+        approved = selection.get("approved")
+
+        url = job.get("url")
+        heading = escape(str(job.get("job_title") or "Untitled role"))
+        if url:
+            heading = (
+                f'<a href="{escape(str(url), quote=True)}" target="_blank" '
+                f'rel="noopener noreferrer">{heading}</a>'
+            )
+
+        concerns = review.get("job_concerns")
+        concerns_html = (
+            "<p><strong>Worth knowing before you apply</strong></p><ul>"
+            + _list_to_html(concerns) + "</ul>"
+            if isinstance(concerns, list) and concerns else ""
+        )
+
+        blocks.append(
+            '<div class="considered">'
+            f'<div class="head">{index}. {heading}</div>'
+            f'<div class="score">{escape(str(job.get("company") or "company not stated"))}'
+            f' &mdash; {escape(str(job.get("location") or "location not stated"))}'
+            f' &mdash; judge score {score}/10'
+            f' &mdash; {"approved" if approved else "viable, not approved"}</div>'
+            f"<p>{escape(str(review.get('job_match_summary') or 'No verdict recorded.'))}</p>"
+            f"{concerns_html}"
+            "</div>"
+        )
+
+    searched = _bullets([
+        f"Target role hint: <strong>{escape(str(target_role or '—'))}</strong>",
+        f"Postings in the pool after filtering and screening: <strong>{pool_size}</strong>",
+        f"Jobs returned: <strong>{len(selections)}</strong>",
+    ])
+    next_steps = _bullets([
+        "To write a tailored resume for one of these, re-run with writing on "
+        "and paste its URL as the job posting.",
+        "These postings were <strong>not</strong> added to "
+        "<code>data/output/selected_jobs.json</code>, so a later search can still "
+        "surface them.",
+    ])
+
+    sections = (
+        _section("Jobs worth applying to", "".join(blocks) or "<p><em>None.</em></p>")
+        + _section("What was searched", searched)
+        + _section("What to do next", next_steps)
+    )
+    return _render_stop_page(
+        title=title,
+        subtitle=f"{len(selections)} job(s) found. No resume was written — writing was off for this run.",
+        banner="Search complete",
+        reason="",
         sections_html=sections,
         run_timestamp=run_timestamp,
     )
