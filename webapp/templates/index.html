@@ -32,12 +32,13 @@
   label { display: block; font-size: 0.82em; font-weight: 600; margin: 12px 0 4px; }
   label:first-of-type { margin-top: 0; }
   .hint { font-weight: 400; color: var(--muted); font-size: 0.92em; }
-  input[type=text], input[type=number], select {
+  input[type=text], input[type=number], select, textarea {
     width: 100%; padding: 7px 9px; border: 1px solid var(--border);
     border-radius: 6px; font: inherit; font-size: 0.92em; background: #fff;
     transition: border-color .15s ease, box-shadow .15s ease;
   }
-  input:focus, select:focus {
+  textarea { resize: vertical; min-height: 64px; line-height: 1.4; }
+  input:focus, select:focus, textarea:focus {
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(31,78,121,.12);
   }
   .modes { display: flex; gap: 8px; margin-bottom: 4px; }
@@ -219,6 +220,26 @@
         </select>
         {% if not resumes %}<div class="note">No PDFs in data/input/ — add one there first.</div>{% endif %}
 
+        <label>Second resume or CV <span class="hint">— optional, merged with the first</span></label>
+        <select id="resume_2">
+          <option value="">— none —</option>
+          {% for f in resumes %}<option value="{{ f.path }}">{{ f.name }}</option>{% endfor %}
+        </select>
+        <div class="note">Both are read as your real background: anything in either one can
+          appear on the resume. Where they disagree on a detail, the <b>first</b> resume wins.
+          The sample template isn't listed here — it's used for layout only.</div>
+
+        <!-- Only meaningful when a resume is being written, so hidden in
+             search-only mode (see setMode). -->
+        <div id="instr-field">
+          <label>Instructions for the writer <span class="hint">— optional</span></label>
+          <textarea id="WRITER_INSTRUCTIONS" rows="3"
+            placeholder="e.g. Lead with the NLP work. Keep it to one page. Use Canadian spelling.">{{ defaults.WRITER_INSTRUCTIONS }}</textarea>
+          <div class="note">Overrides the writer's own choices on emphasis, length and wording,
+            and the judge is told not to undo them. It can't make the writer claim
+            anything your resume doesn't support.</div>
+        </div>
+
         <div id="search-fields">
           <label>Target role <span class="hint">— steers every search angle, so be specific</span></label>
           <input type="text" id="target_role" placeholder="Machine Learning Engineer, NLP and LLMs, Canada">
@@ -380,7 +401,8 @@ const NUMERIC = ["JOB_SCRAPE_CEILING","BM25_KEEP","POOL_SCREEN_MIN_FIT","POOL_SC
   "POOL_SCREEN_SNIPPET_CHARS","JOB_SEARCH_DAYS_OLD","MAX_JOB_SEARCH_CYCLES","MAX_RESUME_REVISE_CYCLES",
   "JUDGE_APPROVAL_SCORE","RESUME_APPROVAL_SCORE","MIN_VIABLE_JOB_SCORE","RESUME_MAX_PAGES","RESUME_PREFERRED_PAGES"];
 const TEXTUAL = ["JOB_SEARCH_SITES","JOBSPY_COUNTRY_INDEED","MODEL_CONTEXT","MODEL_PLANNER",
-  "MODEL_SCREENER","MODEL_WRITER","MODEL_JUDGE","MODEL_JD_EXTRACT","MODEL_ELIGIBILITY"];
+  "MODEL_SCREENER","MODEL_WRITER","MODEL_JUDGE","MODEL_JD_EXTRACT","MODEL_ELIGIBILITY",
+  "WRITER_INSTRUCTIONS"];
 const BOOLEAN = ["JOBSPY_FETCH_LINKEDIN_DESCRIPTIONS","SKIP_PREVIOUSLY_SELECTED"];
 
 let mode = "both", jobCount = 1, since = 0, polling = null, chips = {}, stageNow = 0, runStarted = null;
@@ -391,6 +413,7 @@ function setMode(next) {
     document.getElementById("mode-" + m).classList.toggle("on", m === next));
   document.getElementById("search-fields").style.display = next === "write" ? "none" : "";
   document.getElementById("writer-fields").style.display = next === "write" ? "" : "none";
+  document.getElementById("instr-field").style.display = next === "search" ? "none" : "";
   // The resume stages only exist when writing, so the tracker drops them.
   document.querySelectorAll('.stage[data-stage="3"]').forEach(el =>
     el.style.display = next === "search" ? "none" : "");
@@ -502,6 +525,7 @@ async function startRun() {
       body: JSON.stringify({
         mode: mode,
         resume: document.getElementById("resume").value,
+        resume_2: document.getElementById("resume_2").value,
         target_role: document.getElementById("target_role").value,
         job_source: jdFile || jdUrl,
         settings: collectSettings()

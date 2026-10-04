@@ -112,6 +112,11 @@ def finalize_pending(pending_id: str, selected: list) -> str:
         chosen,
         style_template=state.get("style_template"),
         job_review=state.get("job_review"),
+        # From the saved state, not the environment: this runs as a later,
+        # separate process that never saw the original run's settings.
+        # "" (not None) when the run had none, so the writer doesn't fall
+        # back to whatever WRITER_INSTRUCTIONS happens to be set now.
+        instructions=state.get("writer_instructions") or "",
     )
 
     suffix = state.get("suffix", pending_id)

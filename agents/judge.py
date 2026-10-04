@@ -37,7 +37,7 @@ import json
 import re
 import anthropic
 
-from config import ANTHROPIC_API_KEY, MODEL_JUDGE, JUDGE_APPROVAL_SCORE, RESUME_APPROVAL_SCORE, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES
+from config import ANTHROPIC_API_KEY, MODEL_JUDGE, JUDGE_APPROVAL_SCORE, RESUME_APPROVAL_SCORE, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES, WRITER_INSTRUCTIONS
 from agents.market_context import MARKET_CALIBRATION
 from logger_setup import get_logger, note_model, note_cache
 
@@ -491,6 +491,32 @@ def _known_limitations_block(job_review: dict | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _candidate_instructions_block() -> str:
+    """
+    Show the resume judge the instructions the candidate gave the writer.
+
+    Without this the judge sees only the result and scores it against its
+    own defaults — so a draft that dropped a project because the candidate
+    said to, or ran to one page because they asked, reads as an omission
+    or a thin draft, and the next revision undoes exactly what was asked
+    for. The judge still enforces honesty: complying with an instruction
+    is never a reason to accept overclaiming.
+    """
+    text = (WRITER_INSTRUCTIONS or "").strip()
+    if not text:
+        return ""
+    return (
+        "=== THE CANDIDATE'S OWN INSTRUCTIONS TO THE WRITER ===\n"
+        f"{text}\n"
+        "=== END ===\n"
+        "These are deliberate choices by the candidate. A draft that follows "
+        "them is doing its job: do not deduct for, raise as a gap, or suggest "
+        "reversing anything the draft did because of them. Do flag it if the "
+        "draft IGNORED an instruction. Honesty still outranks them — an "
+        "instruction never makes an unsupported claim acceptable.\n\n"
+    )
+
+
 def review_resume(
     resume_draft: str,
     candidate_context: str,
@@ -555,6 +581,7 @@ def review_resume(
                         stable=(
                             f"{template_block}"
                             f"{_known_limitations_block(job_review)}"
+                            f"{_candidate_instructions_block()}"
                             f"Candidate background:\n{candidate_context}\n\n"
                             f"{job_block}"
                         ),

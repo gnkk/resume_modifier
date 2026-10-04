@@ -24,7 +24,7 @@ employers, so it's not the place to cut cost.
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, MODEL_WRITER, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES
+from config import ANTHROPIC_API_KEY, MODEL_WRITER, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES, WRITER_INSTRUCTIONS
 from logger_setup import get_logger, note_model, note_cache
 
 log = get_logger(__name__)
@@ -126,6 +126,8 @@ every fact. If no template is given, use the standard ATS section set below.
 Self-check before you output (fix any that fail):
 - The first line is `# <candidate's full name>` — a level-1 heading, not \
 plain text, not bold.
+- Every entry title is a `### ` heading, and there is a blank line before \
+each bullet list.
 - Every entry within a section uses the identical header shape.
 - No section label is repeated as the first words of its own content \
 (never a "Certifications" section whose first bullet begins "Certifications:").
@@ -157,6 +159,18 @@ used for layout. Get the STRUCTURE right (heading levels, one fact per \
 line, consistent entry shape) and the rendering handles how it looks.
 - Put each part of an entry on its own line — title line, then the meta line \
 (company, location, dates) — rather than running them together.
+- Use this exact Markdown structure, regardless of how the template resume \
+looks. The template is text extracted from a PDF, so it shows no Markdown \
+at all — copy its section order, wording and content shape, but NOT its \
+lack of formatting:
+  - Section headers: `## SECTION NAME`
+  - Every entry title (role, project, degree): `### Title`, on its own line
+  - The entry's meta line directly under it (employer, client, location), \
+ending with ` | ` and the date range, e.g. \
+`Quest Global — client: X | Apr 2023 – Nov 2023`
+  - A BLANK LINE, then the bullets. Without the blank line the bullets \
+are not parsed as a list and render as plain text.
+  - Skills rows: `**Label:** item, item, item`, one row per line.
 - The gaps/notes section, if needed, goes at the very end under its own \
 "## Notes (not part of the resume)" heading so it's unambiguous that it's \
 not resume content.
@@ -314,11 +328,85 @@ def _settled_gaps_block(job_review: dict | None) -> str:
     )
 
 
+def _job_block(job: dict) -> str:
+    """
+    The target-job block, built identically for every call in this module.
+
+    It sits inside the cached prefix, so it must be byte-identical across
+    draft, revise and apply — one differing character and each function
+    writes its own cache entry and none of them read another's. It was
+    once three hand-written copies, and the draft's carried a Posting URL
+    line the other two didn't: the draft's cache entry was paid for and
+    never read. One builder makes that drift impossible.
+    """
+    return (
+        f"Target job: {job.get('job_title')} at {job.get('company')} "
+        f"({job.get('location')})\n"
+        f"Posting URL: {job.get('url')}\n"
+        f"Requirements/responsibilities:\n{job.get('full_requirements')}\n"
+    )
+
+
+def _instructions_block(instructions: str | None) -> str:
+    """
+    The candidate's own instructions for this resume, or "" when none.
+
+    Placed inside the cached prefix: the text is fixed for the whole run,
+    so it costs one cache write and is read back on every later call.
+
+    Framed as outranking the default style and emphasis rules — the
+    candidate knows things about this application the writer can't, like
+    which project the hiring manager asked about — but NOT the honesty
+    rules. "Say I led the migration" when the background says they
+    contributed to it would turn this box into a way to launder
+    fabrication past every other safeguard in the pipeline.
+    """
+    text = (instructions if instructions is not None else WRITER_INSTRUCTIONS) or ""
+    if not text.strip():
+        return ""
+    return (
+        "=== INSTRUCTIONS FROM THE CANDIDATE FOR THIS RESUME ===\n"
+        f"{text.strip()}\n"
+        "=== END INSTRUCTIONS ===\n"
+        "Follow these. Where they conflict with your default choices about "
+        "emphasis, ordering, length, wording or what to leave out, the "
+        "candidate's instructions win — they know this application better "
+        "than you do. The one exception is honesty: if an instruction would "
+        "require stating something the candidate's background does not "
+        "support, do not do it, and say so in the Notes section.\n\n"
+    )
+
+
+def _stable_prefix(
+    style_template: str | None,
+    job_review: dict | None,
+    instructions: str | None,
+    candidate_context: str,
+    job: dict,
+) -> str:
+    """
+    Everything that is fixed for this job's whole writer loop — the part
+    that goes before the cache breakpoint.
+
+    Built in one place for the same reason as _job_block(): draft, revise
+    and apply must produce byte-identical prefixes to share a cache entry,
+    and three hand-assembled copies had already drifted once.
+    """
+    return (
+        f"{_template_block(style_template)}"
+        f"{_settled_gaps_block(job_review)}"
+        f"{_instructions_block(instructions)}"
+        f"Candidate background:\n{candidate_context}\n\n"
+        f"{_job_block(job)}"
+    )
+
+
 def draft_resume(
     candidate_context: str,
     job: dict,
     style_template: str | None = None,
     job_review: dict | None = None,
+    instructions: str | None = None,
 ) -> str:
     """
     Draft an initial tailored, ATS-ready resume.
@@ -340,12 +428,7 @@ def draft_resume(
         RuntimeError: if the underlying Claude API call fails, or the model
             returns no resume text at all.
     """
-    job_block = (
-        f"Target job: {job.get('job_title')} at {job.get('company')} "
-        f"({job.get('location')})\n"
-        f"Posting URL: {job.get('url')}\n"
-        f"Requirements/responsibilities:\n{job.get('full_requirements')}\n"
-    )
+    job_block = _job_block(job)
     # Streamed, not a plain create(). The SDK refuses non-streaming
     # requests whose estimated duration could exceed 10 minutes, and
     # MAX_OUTPUT_TOKENS is large enough to trip that guard. Streaming
@@ -362,11 +445,9 @@ def draft_resume(
                 {
                     "role": "user",
                     "content": _user_blocks(
-                        stable=(
-                            f"{_template_block(style_template)}"
-                            f"{_settled_gaps_block(job_review)}"
-                            f"Candidate background:\n{candidate_context}\n\n"
-                            f"{job_block}"
+                        stable=_stable_prefix(
+                            style_template, job_review, instructions,
+                            candidate_context, job,
                         ),
                         varying="Draft the tailored, ATS-ready resume now.",
                     ),
@@ -404,6 +485,7 @@ def revise_resume(
     judge_feedback: dict,
     style_template: str | None = None,
     job_review: dict | None = None,
+    instructions: str | None = None,
 ) -> str:
     """
     Revise a resume draft based on the judge's critique.
@@ -424,11 +506,7 @@ def revise_resume(
     Raises:
         RuntimeError: if the underlying Claude API call fails.
     """
-    job_block = (
-        f"Target job: {job.get('job_title')} at {job.get('company')} "
-        f"({job.get('location')})\n"
-        f"Requirements/responsibilities:\n{job.get('full_requirements')}\n"
-    )
+    job_block = _job_block(job)
     feedback_block = (
         f"Fitness score given: {judge_feedback.get('fitness_score')}/10\n"
         f"Verdict: {judge_feedback.get('fitness_summary')}\n"
@@ -446,11 +524,9 @@ def revise_resume(
                 {
                     "role": "user",
                     "content": _user_blocks(
-                        stable=(
-                            f"{_template_block(style_template)}"
-                            f"{_settled_gaps_block(job_review)}"
-                            f"Candidate background:\n{candidate_context}\n\n"
-                            f"{job_block}"
+                        stable=_stable_prefix(
+                            style_template, job_review, instructions,
+                            candidate_context, job,
                         ),
                         varying=(
                             f"Your previous draft:\n{previous_draft}\n\n"
@@ -489,6 +565,7 @@ def apply_selected_suggestions(
     selected: list[str],
     style_template: str | None = None,
     job_review: dict | None = None,
+    instructions: str | None = None,
 ) -> str:
     """
     Apply ONLY the suggestions the user ticked, and change nothing else.
@@ -514,11 +591,7 @@ def apply_selected_suggestions(
         return previous_draft
 
     listed = "\n".join(f"{i}. {item}" for i, item in enumerate(selected, 1))
-    job_block = (
-        f"Target job: {job.get('job_title')} at {job.get('company')} "
-        f"({job.get('location')})\n"
-        f"Requirements/responsibilities:\n{job.get('full_requirements')}\n"
-    )
+    job_block = _job_block(job)
     instruction = (
         "=== APPLY EXACTLY THESE EDITS, AND NOTHING ELSE ===\n"
         f"{listed}\n"
@@ -554,11 +627,9 @@ def apply_selected_suggestions(
                     # on a single call, which is cheaper than the hit is
                     # worth when it lands.
                     "content": _user_blocks(
-                        stable=(
-                            f"{_template_block(style_template)}"
-                            f"{_settled_gaps_block(job_review)}"
-                            f"Candidate background:\n{candidate_context}\n\n"
-                            f"{job_block}"
+                        stable=_stable_prefix(
+                            style_template, job_review, instructions,
+                            candidate_context, job,
                         ),
                         varying=(
                             f"The approved draft:\n{previous_draft}\n\n"

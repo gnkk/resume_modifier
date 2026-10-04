@@ -112,6 +112,7 @@ from html_renderer import (
 )
 from pdf_renderer import render_resume_pdf, extract_notes
 from job_history import record_selection
+from leak_check import warn_on_template_leaks
 from config import (
     DATA_OUTPUT_DIR,
     DATA_WORK_DIR,
@@ -123,6 +124,7 @@ from config import (
     RUN_MODE,
     JOB_MATCH_COUNT,
     SUGGESTION_GATE,
+    WRITER_INSTRUCTIONS,
 )
 from pending import write_pending
 
@@ -615,12 +617,54 @@ def render_outputs(
     log.info("    (working copies: %s, %s)", md_path, review_path)
 
 
-def _validate_inputs(resume_path: str, job_description_path: str | None) -> None:
-    """Fail fast with a clear message if required input files are missing."""
-    if not os.path.isfile(resume_path):
-        raise FileNotFoundError(
-            f"Resume file not found: '{resume_path}'. Check the path and try again."
+def parse_resume_paths(raw: str) -> list[str]:
+    """
+    Split the resume argument into one or two PDF paths.
+
+    Accepts a single path, or two joined by a comma:
+        data/input/resume.pdf
+        data/input/resume.pdf,data/input/cv.pdf
+
+    A comma in an actual filename is handled by checking the whole string
+    first: if it names an existing file, it is taken as one path.
+
+    Raises:
+        ValueError: on more than two paths, a duplicate, or the sample
+            template passed as a resume. The template is a layout spec for
+            someone else's resume — reading it as the candidate's background
+            would feed a stranger's employers and dates in as facts.
+    """
+    raw = (raw or "").strip()
+    if os.path.isfile(raw):
+        paths = [raw]
+    else:
+        paths = [part.strip() for part in raw.split(",") if part.strip()]
+
+    if len(paths) > 2:
+        raise ValueError(
+            f"{len(paths)} resumes given; at most 2 are supported "
+            "(a resume plus one other resume or CV)."
         )
+    if len(paths) == 2 and os.path.abspath(paths[0]) == os.path.abspath(paths[1]):
+        raise ValueError("The same resume was given twice — pass it once.")
+    for path in paths:
+        if os.path.abspath(path) == os.path.abspath(SAMPLE_RESUME_PATH):
+            raise ValueError(
+                f"'{path}' is the sample template, not your resume. The template "
+                "is read automatically for layout only; pass your own resume/CV."
+            )
+    return paths
+
+
+def _validate_inputs(resume_paths: list[str], job_description_path: str | None) -> None:
+    """Fail fast with a clear message if required input files are missing."""
+    if not resume_paths:
+        raise FileNotFoundError("No resume was given.")
+    for resume_path in resume_paths:
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(
+                f"Resume file not found: '{resume_path}'. Check the path and try again."
+            )
     # A URL is validated by fetching it, not by the filesystem.
     if (
         job_description_path
@@ -636,14 +680,20 @@ def _validate_inputs(resume_path: str, job_description_path: str | None) -> None
 def main():
     if len(sys.argv) not in (3, 4):
         print(
-            'Usage: python main.py <path_to_resume.pdf> "<target role description>" '
+            'Usage: python main.py <resume.pdf>[,<cv.pdf>] "<target role description>" '
             "[job URL or path to job_description.txt]\n"
+            "Up to two resume/CV PDFs, comma-separated, merged into one background.\n"
             "Environment: RUN_MODE=search|write|both, JOB_MATCH_COUNT=1..3"
         )
         sys.exit(1)
 
-    resume_path, target_role = sys.argv[1], sys.argv[2]
+    resume_arg, target_role = sys.argv[1], sys.argv[2]
     job_source = sys.argv[3] if len(sys.argv) == 4 else None
+    try:
+        resume_paths = parse_resume_paths(resume_arg)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
 
     log_file_path = get_log_file_path()
     run_ts = get_run_timestamp()
@@ -674,7 +724,7 @@ def main():
     )
 
     try:
-        _validate_inputs(resume_path, job_source)
+        _validate_inputs(resume_paths, job_source)
 
         step("Gathering candidate context from resume + GitHub...")
         # The job description is deliberately NOT passed here. It would be
@@ -682,8 +732,10 @@ def main():
         # receives labelled "Candidate background" — a posting's
         # requirements travelling as facts about the candidate. It goes to
         # job["full_requirements"] instead (see agents/jd_agent.py).
-        candidate_context = gather_candidate_context(resume_path)
+        candidate_context = gather_candidate_context(resume_paths)
         style_template = load_style_template() if writing else None
+        if writing and WRITER_INSTRUCTIONS:
+            log.info("  Writer instructions for this run: %s", WRITER_INSTRUCTIONS)
 
         # --- Job stage -------------------------------------------------
         if job_supplied:
@@ -792,6 +844,16 @@ def main():
             final_draft, resume_review, resume_history = run_resume_revise_loop(
                 candidate_context, job, style_template=style_template, job_review=job_review
             )
+            # The template's text rides in the same prompt as the candidate's
+            # background, separated only by delimiters and an instruction. That
+            # holds in practice, and the resume judge is a second check, but
+            # neither is mechanical. This one is: anything that appears in the
+            # template AND the draft but nowhere in the candidate's own
+            # documents gets flagged. Advisory — it warns, never blocks.
+            warn_on_template_leaks(
+                final_draft, style_template, candidate_context,
+                job_label=f"{job.get('job_title')} at {job.get('company')}",
+            )
             results.append((job, job_review, resume_review, resume_history, final_draft))
 
         # --- Suggestion gate, or render --------------------------------
@@ -837,6 +899,11 @@ def main():
                         "style_template": style_template,
                         "job_supplied": job_supplied,
                         "suggestions": suggestions,
+                        # Saved with the draft because finalize.py runs later,
+                        # as a separate process, whose environment will not
+                        # carry the run's WRITER_INSTRUCTIONS. Without this the
+                        # final pass would silently drop what you asked for.
+                        "writer_instructions": WRITER_INSTRUCTIONS,
                     },
                 )
                 paused += 1

@@ -36,6 +36,10 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INPUT_DIR = PROJECT_ROOT / "data" / "input"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
+# Matches config.SAMPLE_RESUME_PATH's filename. Not imported from config,
+# because this module deliberately avoids importing config at startup (a
+# missing .env should surface per-request, not as a server that won't boot).
+SAMPLE_RESUME_NAME = "sample_resume.pdf"
 
 app = Flask(__name__)
 
@@ -79,6 +83,7 @@ TUNABLES = {
     "MODEL_JD_EXTRACT": "str",
     "MODEL_ELIGIBILITY": "str",
     "SUGGESTION_GATE": "bool",
+    "WRITER_INSTRUCTIONS": "str",
 }
 
 
@@ -122,10 +127,17 @@ def _stream_process(process: subprocess.Popen) -> None:
 
 @app.route("/")
 def index():
+    # The sample template is left out of the resume choices. It is read
+    # automatically as a LAYOUT spec; picking it as a resume would feed
+    # another person's employers and dates in as the candidate's facts.
+    resumes = [
+        f for f in _list_files(INPUT_DIR, (".pdf",))
+        if f["name"].lower() != SAMPLE_RESUME_NAME
+    ]
     return render_template(
         "index.html",
         defaults=_defaults(),
-        resumes=_list_files(INPUT_DIR, (".pdf",)),
+        resumes=resumes,
         jd_files=_list_files(INPUT_DIR, (".txt", ".md")),
     )
 
@@ -180,6 +192,7 @@ def run():
     try:
         payload = request.get_json(force=True) or {}
         resume = (payload.get("resume") or "").strip()
+        resume_2 = (payload.get("resume_2") or "").strip()
         mode = payload.get("mode", "both")
         target_role = (payload.get("target_role") or "").strip()
         job_source = (payload.get("job_source") or "").strip()
@@ -188,6 +201,8 @@ def run():
             return jsonify({"error": f"Unknown mode '{mode}'."}), 400
         if not resume:
             return jsonify({"error": "Choose a resume PDF."}), 400
+        if resume_2 and resume_2 == resume:
+            return jsonify({"error": "The second resume is the same file as the first — pick a different one or none."}), 400
         if mode == "write" and not job_source:
             return jsonify({"error": "Writing from a supplied job needs a posting — pick a file or paste a URL."}), 400
         if mode in ("search", "both") and not target_role:
@@ -196,7 +211,10 @@ def run():
         # main.py treats a third argument as "a job was supplied", which
         # implies write-only. So the argument is passed ONLY in write mode;
         # search and both are distinguished by RUN_MODE instead.
-        argv = [sys.executable, "-u", "main.py", resume, target_role or "-"]
+        # Two resumes travel as one comma-joined argument, which is the form
+        # main.py's parse_resume_paths() takes from the CLI too.
+        resume_arg = f"{resume},{resume_2}" if resume_2 else resume
+        argv = [sys.executable, "-u", "main.py", resume_arg, target_role or "-"]
         if mode == "write":
             argv.append(job_source)
 

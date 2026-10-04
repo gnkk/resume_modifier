@@ -135,6 +135,12 @@ _DATE_RE = re.compile(
 _TAG_RE = re.compile(r"<[^>]+>")
 _BR_RE = re.compile(r"<br\s*/?>")
 
+_BULLET_RE = re.compile(r"^\s*[-*+]\s+")
+# A Skills-style row: a short label, a colon, then the items. The label
+# excludes periods so a prose sentence with a colon later on can't match,
+# and lines already bolded are left alone.
+_KV_LINE_RE = re.compile(r"^(?!\*\*)([A-Z][^:.\n]{1,45}):\s+(\S.*)$")
+
 
 def _strip_tags(text: str) -> str:
     return _TAG_RE.sub("", text).strip()
@@ -187,6 +193,102 @@ def _split_header(markdown_text: str) -> tuple[str, str]:
         if line.startswith("## "):
             return "\n".join(lines[:i]).strip(), "\n".join(lines[i:]).strip()
     return "", markdown_text
+
+
+def _normalize_plain_block(lines: list[str]) -> tuple[str, str | None]:
+    """
+    Reshape one block of body Markdown. Returns (markdown, kind) where kind
+    is "entry", "kv" or None, for the caller's summary log line.
+    """
+    head, index = [], 0
+    while index < len(lines) and not _BULLET_RE.match(lines[index]):
+        head.append(lines[index])
+        index += 1
+    bullets = lines[index:]
+    head = [line.strip() for line in head if line.strip()]
+
+    # Skills rows written as "Label: items" — bold the label so they get
+    # the .kv treatment. Only when EVERY line in the block is such a row,
+    # so a stray colon in prose can't trigger it.
+    if head and not bullets and all(_KV_LINE_RE.match(line) for line in head):
+        return "\n".join(_KV_LINE_RE.sub(r"**\1:** \2", line) for line in head), "kv"
+
+    title = head[0] if head else ""
+    looks_like_title = (
+        2 <= len(head) <= 4
+        and not title.startswith(("#", "**"))
+        and len(title) <= 120
+        and not title.endswith(".")
+    )
+    has_date = any(_DATE_RE.match(line) for line in head[1:])
+
+    if looks_like_title and (has_date or bullets):
+        rest = head[1:]
+        meta = [line for line in rest if not _DATE_RE.match(line)]
+        dates = [line for line in rest if _DATE_RE.match(line)]
+        # The date goes LAST in the meta paragraph: _lift_date() takes a
+        # trailing date segment and floats it right on the title line.
+        meta_block = "\n".join(meta + dates[:1])
+        rebuilt = f"### {title}\n{meta_block}" if meta_block else f"### {title}"
+        if bullets:
+            rebuilt += "\n\n" + "\n".join(bullets)
+        return rebuilt, "entry"
+
+    # Not an entry, but a list directly under a line of text still needs a
+    # blank line to be parsed as a list at all.
+    if head and bullets:
+        return "\n".join(head) + "\n\n" + "\n".join(bullets), None
+    return "\n".join(lines), None
+
+
+def _normalize_plain_entries(body_md: str) -> str:
+    """
+    Give plain-text entries and Skills rows the Markdown structure the
+    rest of this module keys on.
+
+    The writer copies the template resume's layout, and that template is
+    text extracted from a PDF — it has no Markdown in it. So an entry can
+    arrive as three bare lines (title, date, employer) with no `###` or
+    bold, and a Skills row as "Label: items" with no bold label. Rendered
+    as-is, every entry title comes out as body text with the date stuck
+    inline, which is what makes a generated resume look unfinished.
+
+    Two more things this fixes along the way:
+    - Python-Markdown only starts a list after a BLANK line. Bullets placed
+      directly under an employer line are otherwise swallowed into that
+      paragraph as literal "- " text.
+    - A section heading followed immediately by its first line (no blank
+      line between) is split so the block logic below sees the content.
+
+    Conservative by design: a block becomes an entry only when it opens
+    with a short, non-sentence title line followed by 1-3 more lines AND
+    either a date line or a bullet list. Prose paragraphs, bullet-only
+    sections and already-structured entries (`###` or `**bold**`) pass
+    through, so a correctly formatted resume renders exactly as before.
+    """
+    out_blocks = []
+    promoted = {"entry": 0, "kv": 0}
+    for block in re.split(r"\n\s*\n", body_md):
+        lines = block.split("\n")
+        headings = []
+        while lines and lines[0].lstrip().startswith("#"):
+            headings.append(lines.pop(0))
+
+        parts = ["\n".join(headings)] if headings else []
+        if any(line.strip() for line in lines):
+            rebuilt, kind = _normalize_plain_block(lines)
+            if kind:
+                promoted[kind] += 1
+            parts.append(rebuilt)
+        out_blocks.append("\n\n".join(parts))
+
+    if promoted["entry"] or promoted["kv"]:
+        log.info(
+            "  Note: the resume used plain-text entry lines — formatted %d entry "
+            "title(s) and %d skills row(s) so they render as headings.",
+            promoted["entry"], promoted["kv"],
+        )
+    return "\n\n".join(out_blocks)
 
 
 def _promote_bold_entry_titles(body_md: str) -> str:
@@ -348,7 +450,7 @@ def _prepare_html(resume_markdown: str) -> str:
     header_md, body_md = _split_header(cleaned)
 
     body_html = md_lib.markdown(
-        _promote_bold_entry_titles(body_md),
+        _promote_bold_entry_titles(_normalize_plain_entries(body_md)),
         extensions=["extra", "sane_lists", "nl2br"],
     )
     body_html = _tag_kv_paragraphs(_shape_entries(body_html))

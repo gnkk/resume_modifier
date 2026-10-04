@@ -340,6 +340,22 @@ DATA_WORK_DIR = os.path.join(DATA_DIR, "work")
 # immediately, suggestions reported afterwards on the review page).
 SUGGESTION_GATE = _env_bool("SUGGESTION_GATE", True)
 
+# --- Writer instructions -----------------------------------------------
+# Free-text guidance from you to the writer for one run: "lead with the NLP
+# work", "keep it to one page", "don't mention the Kerala project",
+# "use Canadian spelling". Empty by default — the writer's own rules cover
+# the normal case, and this is for the things only you know about a
+# particular application.
+#
+# Set from the web UI's instructions box, or WRITER_INSTRUCTIONS in the
+# environment. The resume judge is shown the same text, so it doesn't
+# mark the writer down for doing what you asked.
+#
+# These steer the writing; they cannot relax the honesty rules. An
+# instruction to claim experience the resume and CV don't support is
+# declined by the writer, not followed.
+WRITER_INSTRUCTIONS = _env_str("WRITER_INSTRUCTIONS", "")
+
 # Running ledger of the job each run finally settled on, carried ACROSS runs
 # (unlike everything else, which is per-run). Postings already selected in an
 # earlier run are filtered out of the pool before screening, so consecutive

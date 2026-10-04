@@ -66,44 +66,80 @@ SYSTEM_PROMPT_BASE = """You are a candidate-context assistant. Your only job \
 is to gather information ABOUT THE CANDIDATE — you do not look for jobs; a \
 separate agent handles that.
 
-You will be given a path to the candidate's existing resume PDF, and \
+You will be given the path to the candidate's resume PDF, and optionally a \
+SECOND PDF — another resume or a longer CV for the same person — plus \
 OPTIONALLY a path to a job description .txt file the user has already saved.
 
-1. Always read the existing resume with read_pdf first. This is the \
-candidate's real, factual background — the only source of truth for what \
-they have actually done.
-2. If a job description file path was provided, read it with read_text_file \
+1. Read EVERY resume/CV PDF you are given with read_pdf, before writing \
+anything. These are the candidate's real, factual background — the only \
+source of truth for what they have actually done.
+2. When there are two, they describe the SAME person, usually written at \
+different times or for different audiences, so each typically holds things \
+the other left out. Merge them into ONE background:
+   - Take the union: every role, project, publication, certification, skill \
+and education entry that appears in either document.
+   - State each fact once. The same role described in both is one role — \
+combine the bullets, don't list it twice.
+   - Where the two DISAGREE on a fact (a date, a title, a number, an \
+employer name), the FIRST document wins: use its version in the \
+background, every time, even if the second looks more specific or more \
+recent. The first document is the one the candidate chose as primary, and \
+they know which of their own versions is correct. Still list every \
+disagreement under a separate DISCREPANCIES heading — the first \
+document's version, then what the second says — so the conflict stays \
+visible rather than disappearing.
+   - Precedence applies ONLY to conflicts. A detail that appears in only \
+one of the documents is not a conflict and is still a real part of the \
+candidate's background, whichever document it came from.
+3. If a job description file path was provided, read it with read_text_file \
 and include its content verbatim in your summary — this will be handed to \
 the search agent as a strong signal of what to look for, or to the writer \
 directly if the job is already fully decided.
-3. Capture the candidate's background in full and faithfully: every role \
+4. Capture the candidate's background in full and faithfully: every role \
 with employer, title, dates and what they actually did; education; skills; \
 projects; certifications; contact details. Downstream agents see only your \
-summary, never the original PDF — anything you leave out cannot appear on \
+summary, never the original PDFs — anything you leave out cannot appear on \
 the resume. Do not editorialize, rank, or trim for relevance; that is the \
 writer's job."""
 
 SYSTEM_PROMPT_GITHUB_ADDENDUM = """
-4. Use the GitHub tools to look at the candidate's repositories (README \
+5. Use the GitHub tools to look at the candidate's repositories (README \
 content, project structure, languages used, notable projects) for concrete \
 project details worth highlighting on a resume. Prioritize pinned/recently \
 updated repos and README quality over an exhaustive crawl.
-5. Stop once you have the candidate's full resume content and enough GitHub \
+6. Stop once you have the candidate's full resume content and enough GitHub \
 project detail to meaningfully supplement it (or a clear note that GitHub \
 had nothing to add)."""
 
 SYSTEM_PROMPT_NO_GITHUB_ADDENDUM = """
-4. Stop once you have the candidate's full resume content (and job \
+5. Stop once you have read every resume/CV and merged them (and the job \
 description content, if provided)."""
 
 SYSTEM_PROMPT_TAIL = """
 
 Structure your final summary in clearly labeled sections, e.g.:
 CANDIDATE BACKGROUND: <everything factual about the candidate>
+DISCREPANCIES (only if two documents were given and they disagree): \
+<each conflicting fact: the first document's version (used above), then \
+the second's>
 JOB DESCRIPTION (if provided): <verbatim content>
 
 Do not draft resume content and do not search the web for jobs — your output \
 is a structured summary of the candidate's background, nothing else."""
+
+# At most two candidate documents: a resume, plus one other resume or a
+# longer CV. Two covers the real case — a tight resume and a fuller CV that
+# each hold things the other dropped — while keeping the merge a judgment a
+# model can make reliably. Every downstream prompt carries this summary
+# inside its cached prefix, so it is also a ceiling on how large that
+# prefix can grow.
+MAX_RESUMES = 2
+
+# Per-document cap on what a read_pdf tool result passes back. A one-page
+# resume is a few thousand characters, but a CV routinely runs past the
+# old 8,000 and was being cut off mid-document — silently, since nothing
+# downstream can tell a truncated career from a short one.
+TOOL_RESULT_CHARS = 20000
 
 
 _LOCAL_TOOL_NAMES = {"read_pdf", "read_text_file"}
@@ -125,14 +161,17 @@ def _execute_tool(name: str, tool_input: dict) -> str:
 
 
 def gather_candidate_context(
-    resume_pdf_path: str,
+    resume_pdf_paths: str | list[str],
     job_description_path: str | None = None,
 ) -> str:
     """
     Run the context agent's tool-calling loop.
 
     Args:
-        resume_pdf_path: Path to the candidate's existing resume PDF.
+        resume_pdf_paths: The candidate's resume PDF, or a list of one or
+            two PDFs — a resume plus another resume or a fuller CV. Two are
+            merged into a single background, with conflicting facts listed
+            separately rather than silently resolved.
         job_description_path: Optional path to a .txt file containing
             a job description the user already has in hand.
 
@@ -142,13 +181,37 @@ def gather_candidate_context(
         to the search agent and/or writer.
 
     Raises:
+        ValueError: if no path, or more than MAX_RESUMES, is given.
         RuntimeError: if the underlying Claude API call fails in a way
             that can't be recovered from (e.g. auth failure, persistent
             network error), or if the agent produces no summary at all.
     """
+    paths = [resume_pdf_paths] if isinstance(resume_pdf_paths, str) else list(resume_pdf_paths)
+    paths = [p for p in paths if p and p.strip()]
+    if not paths:
+        raise ValueError("gather_candidate_context: no resume PDF was given.")
+    if len(paths) > MAX_RESUMES:
+        raise ValueError(
+            f"gather_candidate_context: {len(paths)} resumes given; at most "
+            f"{MAX_RESUMES} are supported."
+        )
+
     use_github = bool(GITHUB_PAT)
 
-    user_prompt = f"My existing resume is at: {resume_pdf_path}\n"
+    if len(paths) == 1:
+        user_prompt = f"My resume is at: {paths[0]}\n"
+    else:
+        user_prompt = (
+            "I have two documents describing my background — read both and "
+            "merge them. Document 1 is my primary: where the two disagree on "
+            "a fact, use document 1's version.\n"
+            f"  1. (primary) {paths[0]}\n"
+            f"  2. {paths[1]}\n"
+        )
+        log.info(
+            "  Merging 2 resume/CV documents (conflicts resolved in favour of the first): %s",
+            ", ".join(paths),
+        )
     if job_description_path:
         user_prompt += (
             f"I also already have a job description saved at: "
@@ -254,7 +317,7 @@ def gather_candidate_context(
                     {
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": result[:8000],
+                        "content": result[:TOOL_RESULT_CHARS],
                     }
                 )
             # GitHub MCP tool calls (when enabled) are executed server-side

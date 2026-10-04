@@ -196,7 +196,9 @@ behaviour.
    > **Never commit `.env`.** It's in `.gitignore`. If a key is ever
    > exposed, rotate it immediately at the provider.
 
-4. **Add your resume** — any PDF in `data/input/`.
+4. **Add your resume** — any PDF in `data/input/`. Optionally add a
+   second one: another version of your resume, or a longer CV (see
+   "Two resumes" below).
 
 5. **(Optional) Add a sample resume** at `data/input/sample_resume.pdf`
    as a layout template (see "Sample resume").
@@ -242,6 +244,39 @@ python main.py data/input/my_resume.pdf "-" https://boards.greenhouse.io/acme/jo
 # Saved description — always works, no fetch involved
 python main.py data/input/my_resume.pdf "-" data/input/job_description.txt
 ```
+
+### Two resumes
+
+You can give a second PDF — another version of your resume, or a fuller
+CV. In the web UI, pick it in **Second resume or CV**; on the CLI, join
+the two with a comma:
+
+```bash
+python main.py data/input/resume.pdf,data/input/cv.pdf "Data Scientist, Canada"
+```
+
+The context agent reads both and merges them into one background: every
+role, project and skill from either document, each stated once. A detail
+that appears in only one of them is still part of your background.
+
+Where they **disagree** on a fact (a date, a title, a number), **the
+first resume wins** — the one in the first dropdown, or first before the
+comma on the CLI. That holds even when the second looks more specific or
+more recent: you know which of your own versions is correct, and the
+order is how you say so. The conflict is still listed under a separate
+DISCREPANCIES heading in the candidate summary, so it doesn't vanish.
+
+Precedence only applies to conflicts. It doesn't make the second
+document a lesser source for everything else.
+
+Two is the limit. It covers the real case — a tight resume and a fuller
+CV that each dropped different things — and keeps the merge reliable.
+The merged summary also sits inside every cached prompt downstream, so it
+bounds how large those grow.
+
+The sample template (`sample_resume.pdf`) is unaffected and is refused if
+passed as a resume — it's someone else's layout, and reading it as your
+background would feed their employers and dates in as your facts.
 
 ### Supplying a posting by URL
 
@@ -550,6 +585,13 @@ All in `config.py`.
 - `RESUME_MAX_PAGES` (3), `RESUME_PREFERRED_PAGES` (2)
 - `SUGGESTION_GATE` (True) — pause before rendering so you can pick which
   of the judge's suggestions make it into the PDF
+- `WRITER_INSTRUCTIONS` (empty) — free-text guidance to the writer for one
+  run ("lead with the NLP work", "one page", "Canadian spelling"). Set it in
+  the web UI's **Instructions for the writer** box. It overrides the
+  writer's defaults on emphasis, length and wording, and the resume judge
+  is shown it so it doesn't undo what you asked for. It cannot relax the
+  honesty rules: an instruction to claim something your resume doesn't
+  support is declined and noted in the writer's Notes.
 - `SKIP_PREVIOUSLY_SELECTED` (True)
 
 ## GitHub integration (deferred)
