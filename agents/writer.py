@@ -25,6 +25,7 @@ employers, so it's not the place to cut cost.
 import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL_WRITER, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES, WRITER_INSTRUCTIONS
+from agents.level_agent import level_block
 from logger_setup import get_logger, note_model, note_cache
 
 log = get_logger(__name__)
@@ -53,6 +54,15 @@ posting's term) — this is legitimate ATS keyword alignment, not fabrication.
 architected — vary them, don't repeat the same verb twice) and quantify \
 impact wherever the source material allows it (%, $, time saved, scale, team \
 size). Never invent a number that isn't grounded in the source material.
+- Pitch the resume AT the candidate's calibrated level, when a CANDIDATE \
+LEVEL block is supplied. Language that overstates scope ("led the \
+organization's ML strategy" for someone who delivered within a team) gets \
+the resume screened out for overreach; language that understates it \
+("assisted with", "supported") makes an experienced candidate read as \
+junior. Where the block names a hurdle — a gap, a pivot, an unusual degree \
+— handle it the way the block says: present the strongest true framing, \
+never conceal it, and note it in the Notes section.
+
 - Flag clearly, in a separate "Notes" section at the very end (outside the \
 resume body itself, not mixed into it), any real gaps between the \
 candidate's experience and the job's requirements — do not paper over them, \
@@ -383,6 +393,7 @@ def _stable_prefix(
     instructions: str | None,
     candidate_context: str,
     job: dict,
+    level_profile: dict | None = None,
 ) -> str:
     """
     Everything that is fixed for this job's whole writer loop — the part
@@ -396,6 +407,7 @@ def _stable_prefix(
         f"{_template_block(style_template)}"
         f"{_settled_gaps_block(job_review)}"
         f"{_instructions_block(instructions)}"
+        f"{level_block(level_profile)}"
         f"Candidate background:\n{candidate_context}\n\n"
         f"{_job_block(job)}"
     )
@@ -407,6 +419,7 @@ def draft_resume(
     style_template: str | None = None,
     job_review: dict | None = None,
     instructions: str | None = None,
+    level_profile: dict | None = None,
 ) -> str:
     """
     Draft an initial tailored, ATS-ready resume.
@@ -447,7 +460,7 @@ def draft_resume(
                     "content": _user_blocks(
                         stable=_stable_prefix(
                             style_template, job_review, instructions,
-                            candidate_context, job,
+                            candidate_context, job, level_profile,
                         ),
                         varying="Draft the tailored, ATS-ready resume now.",
                     ),
@@ -486,6 +499,7 @@ def revise_resume(
     style_template: str | None = None,
     job_review: dict | None = None,
     instructions: str | None = None,
+    level_profile: dict | None = None,
 ) -> str:
     """
     Revise a resume draft based on the judge's critique.
@@ -526,7 +540,7 @@ def revise_resume(
                     "content": _user_blocks(
                         stable=_stable_prefix(
                             style_template, job_review, instructions,
-                            candidate_context, job,
+                            candidate_context, job, level_profile,
                         ),
                         varying=(
                             f"Your previous draft:\n{previous_draft}\n\n"
@@ -566,6 +580,7 @@ def apply_selected_suggestions(
     style_template: str | None = None,
     job_review: dict | None = None,
     instructions: str | None = None,
+    level_profile: dict | None = None,
 ) -> str:
     """
     Apply ONLY the suggestions the user ticked, and change nothing else.
@@ -629,7 +644,7 @@ def apply_selected_suggestions(
                     "content": _user_blocks(
                         stable=_stable_prefix(
                             style_template, job_review, instructions,
-                            candidate_context, job,
+                            candidate_context, job, level_profile,
                         ),
                         varying=(
                             f"The approved draft:\n{previous_draft}\n\n"

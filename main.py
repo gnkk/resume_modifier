@@ -93,6 +93,7 @@ configure_logging()
 log = get_logger(__name__)
 
 from agents.context_agent import gather_candidate_context
+from agents.level_agent import assess_level, log_profile
 from agents.search_agent import build_job_pool, next_candidate
 from agents.writer import draft_resume, revise_resume
 from agents.judge import review_job, review_resume
@@ -191,6 +192,7 @@ def find_matching_jobs(
     target_role: str,
     run_ts: str,
     want: int = 1,
+    level_profile: dict | None = None,
 ) -> tuple[list[dict], list[dict], int]:
     """
     Build the job pool once, then walk it until `want` jobs are worth
@@ -219,7 +221,7 @@ def find_matching_jobs(
         viability floor.
     """
     log.info("  Building job pool (scrape ceiling %d, one scraping pass)...", JOB_SCRAPE_CEILING)
-    pool = build_job_pool(candidate_context, target_role)
+    pool = build_job_pool(candidate_context, target_role, level_profile)
     _save_job_pool(pool, run_ts)
 
     if not pool:
@@ -253,7 +255,7 @@ def find_matching_jobs(
         if job.get("url"):
             tried_urls.add(job["url"])
 
-        review = review_job(job, candidate_context)
+        review = review_job(job, candidate_context, level_profile)
         score = review.get("job_match_score")
         approved = bool(review.get("approved", False))
         log.info(
@@ -297,6 +299,7 @@ def run_resume_revise_loop(
     job: dict,
     style_template: str | None = None,
     job_review: dict | None = None,
+    level_profile: dict | None = None,
 ) -> tuple[str, dict, list[dict]]:
     """
     Run the writer <-> judge cycle up to MAX_RESUME_REVISE_CYCLES
@@ -329,13 +332,15 @@ def run_resume_revise_loop(
 
     log.info("  [resume cycle 1/%d] Writer drafting initial resume...", MAX_RESUME_REVISE_CYCLES)
     draft = draft_resume(
-        candidate_context, job, style_template=style_template, job_review=job_review
+        candidate_context, job, style_template=style_template, job_review=job_review,
+        level_profile=level_profile,
     )
 
     for cycle in range(1, MAX_RESUME_REVISE_CYCLES + 1):
         log.info("  [resume cycle %d/%d] Judge reviewing resume draft...", cycle, MAX_RESUME_REVISE_CYCLES)
         review = review_resume(
-            draft, candidate_context, job, style_template=style_template, job_review=job_review
+            draft, candidate_context, job, style_template=style_template,
+            job_review=job_review, level_profile=level_profile,
         )
         history.append({"cycle": cycle, "review": review})
 
@@ -395,13 +400,18 @@ def run_resume_revise_loop(
         draft = revise_resume(
             candidate_context, job, draft, review,
             style_template=style_template, job_review=job_review,
+            level_profile=level_profile,
         )
 
     # Unreachable given the loop above, but keeps type-checkers happy.
     return best[2], best[3], history
 
 
-def run_supplied_job_stage(candidate_context: str, job_source: str) -> tuple[dict, dict]:
+def run_supplied_job_stage(
+    candidate_context: str,
+    job_source: str,
+    level_profile: dict | None = None,
+) -> tuple[dict, dict]:
     """
     The job stage for the SUPPLIED-JOB pipeline: no search, no selection.
 
@@ -451,7 +461,7 @@ def run_supplied_job_stage(candidate_context: str, job_source: str) -> tuple[dic
         log.info("  Note: no application URL was found — the review page will have no link.")
 
     log.info("  Judge assessing the match (for information — this does not gate the run)...")
-    review = review_job(job, candidate_context)
+    review = review_job(job, candidate_context, level_profile)
     score = review.get("job_match_score")
     log.info("    -> job match: %s/10 | %s", score, review.get("job_match_summary", ""))
     if isinstance(score, (int, float)) and score < MIN_VIABLE_JOB_SCORE:
@@ -733,6 +743,15 @@ def main():
         # requirements travelling as facts about the candidate. It goes to
         # job["full_requirements"] instead (see agents/jd_agent.py).
         candidate_context = gather_candidate_context(resume_paths)
+
+        # One calibration, used by every stage below. Without it the planner,
+        # the screener, the job judge and the writer each formed their own
+        # view of the candidate's seniority from the same text, and they
+        # disagreed — the pool would surface a role the judge then rejected
+        # on level, three cycles and several model calls later.
+        level_profile = assess_level(candidate_context, target_role)
+        log_profile(level_profile)
+
         style_template = load_style_template() if writing else None
         if writing and WRITER_INSTRUCTIONS:
             log.info("  Writer instructions for this run: %s", WRITER_INSTRUCTIONS)
@@ -741,7 +760,9 @@ def main():
         if job_supplied:
             step("Using the supplied job posting (no search)...")
             try:
-                job, job_review = run_supplied_job_stage(candidate_context, job_source)
+                job, job_review = run_supplied_job_stage(
+                    candidate_context, job_source, level_profile
+                )
             except JobUnavailableError as exc:
                 # Halt and report. There is no fallback candidate here, and
                 # the failure message carries the copy-paste workaround the
@@ -765,7 +786,8 @@ def main():
                 want, MAX_JOB_SEARCH_CYCLES,
             )
             selections, job_history, pool_size = find_matching_jobs(
-                candidate_context, target_role, run_ts, want=want
+                candidate_context, target_role, run_ts, want=want,
+                level_profile=level_profile,
             )
 
             if not selections:
@@ -842,7 +864,8 @@ def main():
             record_selection(job, run_timestamp=run_ts, review=job_review)
 
             final_draft, resume_review, resume_history = run_resume_revise_loop(
-                candidate_context, job, style_template=style_template, job_review=job_review
+                candidate_context, job, style_template=style_template,
+                job_review=job_review, level_profile=level_profile,
             )
             # The template's text rides in the same prompt as the candidate's
             # background, separated only by delimiters and an instruction. That
@@ -904,6 +927,10 @@ def main():
                         # carry the run's WRITER_INSTRUCTIONS. Without this the
                         # final pass would silently drop what you asked for.
                         "writer_instructions": WRITER_INSTRUCTIONS,
+                        # The final apply pass pitches language at the
+                        # candidate's level too, and finalize.py has no way
+                        # to re-derive this without paying for the call again.
+                        "level_profile": level_profile,
                     },
                 )
                 paused += 1

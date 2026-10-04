@@ -39,6 +39,7 @@ import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL_JUDGE, JUDGE_APPROVAL_SCORE, RESUME_APPROVAL_SCORE, RESUME_MAX_PAGES, RESUME_PREFERRED_PAGES, WRITER_INSTRUCTIONS
 from agents.market_context import MARKET_CALIBRATION
+from agents.level_agent import level_block
 from logger_setup import get_logger, note_model, note_cache
 
 log = get_logger(__name__)
@@ -250,7 +251,11 @@ def _enforce_job_approval_bar(result: dict) -> dict:
     return result
 
 
-def review_job(job: dict, candidate_context: str) -> dict:
+def review_job(
+    job: dict,
+    candidate_context: str,
+    level_profile: dict | None = None,
+) -> dict:
     """
     Critically review the job the search agent picked — no resume
     involved yet. Drives the search-agent <-> judge loop that runs
@@ -296,10 +301,17 @@ def review_job(job: dict, candidate_context: str) -> dict:
                     # breakpoint sits between them, and cycles 2 and 3 read
                     # the context back instead of re-paying for it.
                     "content": _blocks(
-                        stable=f"Candidate background:\n{candidate_context}",
+                        stable=(
+                            f"{level_block(level_profile)}"
+                            f"Candidate background:\n{candidate_context}"
+                        ),
                         varying=(
                             f"\n\n{job_block}\n"
-                            "Evaluate whether this was the right job to target now."
+                            "Evaluate whether this was the right job to target now. "
+                            "Judge the seniority fit in BOTH directions: a role above "
+                            "the candidate's calibrated band wastes the application on "
+                            "a screening rejection, and one clearly below it wastes it "
+                            "on an over-qualification rejection."
                         ),
                     ),
                 }
@@ -523,6 +535,7 @@ def review_resume(
     job: dict,
     style_template: str | None = None,
     job_review: dict | None = None,
+    level_profile: dict | None = None,
 ) -> dict:
     """
     Critically review a drafted resume against the (already-approved)
@@ -582,6 +595,7 @@ def review_resume(
                             f"{template_block}"
                             f"{_known_limitations_block(job_review)}"
                             f"{_candidate_instructions_block()}"
+                            f"{level_block(level_profile)}"
                             f"Candidate background:\n{candidate_context}\n\n"
                             f"{job_block}"
                         ),

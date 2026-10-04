@@ -71,6 +71,7 @@ from config import (
     SKIP_PREVIOUSLY_SELECTED,
 )
 from agents.market_context import MARKET_CALIBRATION
+from agents.level_agent import level_block
 from agents.eligibility import extract_work_eligibility, filter_by_location
 from job_history import filter_seen
 from tools.jobspy_tool import search as jobspy_search_fn
@@ -121,13 +122,25 @@ second chance to broaden later.
 
 {MARKET_CALIBRATION}
 
-Plan only for roles the candidate could realistically be SHORTLISTED for: \
-the core discipline they have actually done, at a seniority within one band \
-of where they sit, and consistent with their hard constraints (work \
-authorization, where they can be, whether they said they can relocate or \
-work remotely). An angle that returns roles they'd be screened out of costs \
-the same as a good one and yields nothing. Do not build an angle around a \
-skill they have touched once, or a title two levels above their experience.
+Plan only for roles the candidate could realistically be SHORTLISTED for. \
+When a CANDIDATE LEVEL block is supplied, it is the calibration: plan \
+within its target bands, lead with its titles, avoid the titles it names, \
+and let its hurdles shape the angles (if local experience is the hurdle, \
+weight the local market; if a career change is, weight titles that value \
+the transferable half). An angle that returns roles they'd be screened out \
+of costs the same as a good one and yields nothing — and that cuts both \
+ways: a role well BELOW their level gets rejected as over-qualified just as \
+reliably. Do not build an angle around a skill they have touched once.
+
+THE TARGET ROLE HINT IS A HINT, NOT A SPECIFICATION. The user typed it \
+quickly and may have named a title that does not match their level, a title \
+employers do not use, or one narrower than the work they could win. Treat \
+it as the direction they want to go, then adjust: correct the seniority to \
+their actual band, swap in the titles employers actually post, and widen to \
+adjacent roles the same background wins. Keep at least one angle close to \
+what they typed — they may know something about their own search that the \
+background does not show — but do not let a badly chosen phrase define the \
+whole run. Where you deviate, say so in that angle's rationale.
 
 Design 2-6 COMPLEMENTARY search angles from the candidate's background and \
 the target role hint. Complementary means each angle should surface postings \
@@ -136,9 +149,9 @@ the others would miss:
 ("Machine Learning Engineer", "Data Scientist", "Applied Scientist", "NLP \
 Engineer", "MLOps Engineer"). Use the titles EMPLOYERS use, not the \
 candidate's own job title.
-- Vary seniority where the candidate's experience genuinely spans it (e.g. \
-both "Senior Data Scientist" and "Data Scientist" if they'd be credible for \
-both). Do not reach for levels their background doesn't support.
+- Vary seniority ONLY within the calibrated target bands. Do not reach for \
+levels the background doesn't support, and do not drop below the bands \
+either — an over-qualified application is a wasted one.
 - Vary LOCATION deliberately. If the candidate can relocate or work remotely, \
 include both their home city and the country's main job markets as separate \
 angles. Omit location entirely on at least one angle for nationwide coverage.
@@ -167,7 +180,11 @@ Respond with ONLY a JSON array, no other text. Each element:
 }}"""
 
 
-def plan_search_angles(candidate_context: str, target_role_description: str) -> list[dict]:
+def plan_search_angles(
+    candidate_context: str,
+    target_role_description: str,
+    level_profile: dict | None = None,
+) -> list[dict]:
     """
     Ask the model for a set of complementary JobSpy search angles.
 
@@ -184,8 +201,10 @@ def plan_search_angles(candidate_context: str, target_role_description: str) -> 
                 {
                     "role": "user",
                     "content": (
+                        f"{level_block(level_profile)}"
                         f"Candidate background:\n{candidate_context}\n\n"
-                        f"Target role hint: {target_role_description}\n\n"
+                        f"Target role hint (adjust it where the calibration says to): "
+                        f"{target_role_description}\n\n"
                         "Plan the search angles now."
                     ),
                 }
@@ -253,6 +272,16 @@ day-to-day is substantially different.
   3-4 — weak: same broad field, real keyword overlap, different actual work.
   1-2 — wrong role, or a hard blocker applies.
 
+When a CANDIDATE LEVEL block is supplied, rate against THAT, not against \
+the raw background. A posting inside its target bands can reach the top of \
+the range; one above them cannot clear 5 however well the keywords match, \
+because the candidate would be screened out. A posting clearly BELOW the \
+bands is also capped at 5 — over-qualified applications are rejected too, \
+and this pipeline exists to get the candidate hired soon, not to collect \
+plausible-looking matches. Where the block names a hurdle, let it inform \
+the rating: a posting that turns that hurdle into a hard requirement is a \
+weak match even when everything else fits.
+
 Use the full range. Do not cluster everything on one or two values — the \
 ratings are sorted afterwards, and a batch rated all-8 carries no more \
 information than a batch rated all-5.
@@ -275,9 +304,10 @@ candidate does not have; or is located somewhere they cannot work.
   "licence"       — requires a licence, registration or accreditation \
 they do not hold.
   "degree"        — states a degree level as a bar that they do not meet.
-  "seniority"     — two or more bands away: staff/principal/director, or \
-a people-management or delivery-lead role, for an individual \
-contributor.
+  "seniority"     — two or more bands away from the candidate's calibrated \
+level in EITHER direction: staff/principal/director or a people-management \
+role for an individual contributor, and equally an intern/graduate/junior \
+role for an experienced candidate.
   "discipline"    — the actual day-to-day is a different job.
 Anything other than "none" forces a fit of 1-2 AND removes the posting \
 from consideration entirely, so use it only for a genuine blocker — \
@@ -293,6 +323,7 @@ def _screen_batch(
     snippets: dict[int, str],
     candidate_context: str,
     target_role_description: str,
+    level_profile: dict | None = None,
 ) -> dict[int, dict]:
     """
     Rate one batch of postings. Returns {pool_index: {"fit": int, "why": str}}.
@@ -323,8 +354,10 @@ def _screen_batch(
                 {
                     "role": "user",
                     "content": (
+                        f"{level_block(level_profile)}"
                         f"Candidate background:\n{candidate_context}\n\n"
-                        f"Target role hint: {target_role_description}\n\n"
+                        f"Target role hint (a hint only — the calibration above wins): "
+                        f"{target_role_description}\n\n"
                         f"Postings to rate:\n{json.dumps(listing, default=str)}\n\n"
                         "Rate every posting now."
                     ),
@@ -368,6 +401,7 @@ def screen_pool(
     pool: list[dict],
     candidate_context: str,
     target_role_description: str,
+    level_profile: dict | None = None,
 ) -> list[dict]:
     """
     Rate every posting against the candidate, drop everything below
@@ -421,7 +455,9 @@ def screen_pool(
     indexed = list(enumerate(pool))
     for start in range(0, len(indexed), POOL_SCREEN_BATCH_SIZE):
         batch = indexed[start : start + POOL_SCREEN_BATCH_SIZE]
-        ratings.update(_screen_batch(batch, snippets, candidate_context, target_role_description))
+        ratings.update(_screen_batch(
+            batch, snippets, candidate_context, target_role_description, level_profile,
+        ))
 
     if not ratings:
         log.error("search_agent.screen_pool: no postings could be rated; keeping the pool unscreened.")
@@ -482,6 +518,7 @@ def screen_pool(
 def build_job_pool(
     candidate_context: str,
     target_role_description: str,
+    level_profile: dict | None = None,
 ) -> list[dict]:
     """
     Run the single scraping pass for this run and return a ranked,
@@ -496,14 +533,18 @@ def build_job_pool(
     did, meant pool membership was decided by angle ordering rather than
     by fit.
     """
-    angles = plan_search_angles(candidate_context, target_role_description)
+    angles = plan_search_angles(candidate_context, target_role_description, level_profile)
     log.info("  Planned %d search angle(s):", len(angles))
     for angle in angles:
         log.info(
-            "    - %r%s%s",
+            "    - %r%s%s%s",
             angle.get("search_term"),
             f" near {angle['location']}" if angle.get("location") else " (nationwide)",
             " [remote]" if angle.get("is_remote") else "",
+            # The planner is allowed to move away from what the user typed;
+            # showing its reasoning is what keeps that from feeling like the
+            # tool quietly ignoring them.
+            f" — {angle['rationale']}" if angle.get("rationale") else "",
         )
 
     pool: list[dict] = []
@@ -566,7 +607,7 @@ def build_job_pool(
     # the candidate — including anything the context agent dropped.
     pool = rank_pool(pool, candidate_context, BM25_KEEP)
 
-    return screen_pool(pool, candidate_context, target_role_description)
+    return screen_pool(pool, candidate_context, target_role_description, level_profile)
 
 
 # ---------------------------------------------------------------------

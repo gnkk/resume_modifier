@@ -117,6 +117,7 @@ def finalize_pending(pending_id: str, selected: list) -> str:
         # "" (not None) when the run had none, so the writer doesn't fall
         # back to whatever WRITER_INSTRUCTIONS happens to be set now.
         instructions=state.get("writer_instructions") or "",
+        level_profile=state.get("level_profile"),
     )
 
     suffix = state.get("suffix", pending_id)
